@@ -5,6 +5,7 @@ single-branch execution, and payload validation.
 
 from __future__ import annotations
 
+import json
 import math
 from collections.abc import Callable, Mapping
 from contextlib import contextmanager
@@ -864,6 +865,27 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                 if rollout_ctx is not None:
                     batch.rollout_trajectory_data = (
                         rollout_ctx.collector.build_trajectory_data()
+                    )
+            if self._cache_dit_enabled:
+                # Read the block adapter's own counters once after the loop;
+                # timing thresholds cannot reliably identify cache hits.
+                from cache_dit import summary
+
+                target = getattr(model, "_sglang_cache_dit_adapter", model)
+                for group, stats in enumerate(summary(target, logging=False)):
+                    if not stats.accumulated_executed_steps:
+                        continue
+                    logger.info(
+                        "H3_CACHE_DIT_STATS %s",
+                        json.dumps(
+                            {
+                                "group": group,
+                                "total_steps": stats.accumulated_executed_steps,
+                                "cache_hits": stats.accumulated_cached_steps,
+                                "cached_steps": stats.cached_steps,
+                                "step_index_base": 0,
+                            }
+                        ),
                     )
         finally:
             self._finish_active_component_use()

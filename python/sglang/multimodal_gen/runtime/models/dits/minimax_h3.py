@@ -97,12 +97,10 @@ from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
 from sglang.multimodal_gen.runtime.models.dits.minimax_h3_adaln_cache import (
     MINIMAX_H3_ADALN_MAX_PLAN_WIDTH,
     MiniMaxH3AdalnCache,
+    native_adaln_weight_files,
 )
 from sglang.multimodal_gen.runtime.models.dits.minimax_h3_adaln_cache import (
     _plan_key as _adaln_plan_key,
-)
-from sglang.multimodal_gen.runtime.models.dits.minimax_h3_adaln_cache import (
-    native_adaln_weight_files,
 )
 from sglang.multimodal_gen.runtime.models.dits.minimax_h3_vdn_attention import (
     MiniMaxH3VDNHybridAttention,
@@ -846,14 +844,104 @@ def _minimax_h3_attention_core_impl(
         if out is not None:
             return out
 
+    transport = None
     if ulysses_active:
         from sglang.multimodal_gen.runtime.layers.usp import (
             _usp_all_gather,
             _usp_input_all_to_all_packed_qkv,
             _usp_output_all_to_all,
         )
+        from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 
-        q, k, v = _usp_input_all_to_all_packed_qkv(q, k, v)
+        args = get_global_server_args()
+        sage_backends = (
+            AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN_SM120_SAGE,
+            AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN_SM120_SAGE_A2A,
+        )
+        if (
+            not ring_active
+            and attention.prefix.startswith("blocks.")
+            and attention._attention_backend_enum in sage_backends
+            and args.minimax_h3_ulysses_transport == "flashinfer-pcie"
+        ):
+            import torch.distributed as dist
+            from sglang.multimodal_gen.runtime.distributed.device_communicators.flashinfer_ulysses_a2a import (
+                get_flashinfer_ulysses_a2a,
+            )
+            from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+                get_sp_group,
+            )
+
+            group = get_sp_group().ulysses_group
+            world = dist.get_world_size(group)
+            local_capacity = (args.minimax_h3_ulysses_max_seq_len + world - 1) // world
+            if q.shape[0] > local_capacity:
+                if args.minimax_h3_ulysses_strict:
+                    raise ValueError("H3 Ulysses sequence exceeds declared capacity")
+            else:
+                transport = get_flashinfer_ulysses_a2a(
+                    group,
+                    q.device,
+                    q.dtype,
+                    capacity=3 * local_capacity * q.shape[1] * q.shape[2],
+                    strict=args.minimax_h3_ulysses_strict,
+                    max_shapes=args.minimax_h3_ulysses_max_sequence_geometries,
+                )
+                if transport is not None:
+                    transport.prepare_geometry(
+                        *q.shape,
+                        q.dtype,
+                        sage_qkv=attention._attention_backend_enum
+                        is AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN_SM120_SAGE_A2A,
+                    )
+
+        if (
+            attention._attention_backend_enum
+            is AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN_SM120_SAGE_A2A
+        ):
+            from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse_attn_sm120_sage_a2a import (
+                subblock_sparse_sage_a2a_forward,
+            )
+
+            out = subblock_sparse_sage_a2a_forward(
+                q,
+                k,
+                v,
+                cu_seqlens_host=cu_seqlens_host,
+                max_seqlen=max_seqlen,
+                softmax_scale=attention.softmax_scale,
+                ulysses_active=ulysses_active,
+                ring_active=ring_active,
+                transport=transport,
+                query_block_mask=subblock_sparse_query_block_mask,
+                layer_enabled=attention._attention_impl.layer_enabled,
+            )
+            if out is not None:
+                gathered = (
+                    transport.exchange_output(out) if transport is not None else None
+                )
+                return (
+                    gathered
+                    if gathered is not None
+                    else _usp_output_all_to_all(out[None], head_dim=2)[0]
+                )
+            if args.minimax_h3_ulysses_strict and attention.prefix.startswith(
+                "blocks."
+            ):
+                raise RuntimeError(
+                    "H3 strict mode: quantization-before-A2A route declined"
+                )
+
+        exchanged = (
+            transport.exchange_input(torch.stack((q, k, v), dim=2))
+            if transport is not None
+            else None
+        )
+        q, k, v = (
+            exchanged
+            if exchanged is not None
+            else _usp_input_all_to_all_packed_qkv(q, k, v)
+        )
 
     if attention._attention_backend_enum is AttentionBackendEnum.VIDEO_SPARSE_ATTN_H3:
         attn_metadata = (
@@ -909,9 +997,10 @@ def _minimax_h3_attention_core_impl(
             ring_ws=ring_ws,
         )
     else:
-        if (
-            attention._attention_backend_enum
-            is AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN
+        if attention._attention_backend_enum in (
+            AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN,
+            AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN_SM120_SAGE,
+            AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN_SM120_SAGE_A2A,
         ):
             impl = attention._attention_impl
             sparse_will_run = (
@@ -948,7 +1037,12 @@ def _minimax_h3_attention_core_impl(
                 cu_seqlens_host=cu_seqlens_host,
             )
     if ulysses_active:
-        out = _usp_output_all_to_all(out[None], head_dim=2)[0]
+        gathered = transport.exchange_output(out) if transport is not None else None
+        out = (
+            gathered
+            if gathered is not None
+            else _usp_output_all_to_all(out[None], head_dim=2)[0]
+        )
     return out
 
 
@@ -1658,6 +1752,10 @@ class MiniMaxH3DiTBlock(nn.Module):
             )
         )
         self.preserve_input_for_cache_dit = False
+        self.adaln_layer_index = -1
+        # A tuple prevents nn.Module from registering the shared cache once
+        # per layer and duplicating its state_dict paths.
+        self._adaln_cache_ref: tuple[MiniMaxH3AdalnCache, ...] = ()
 
     def forward(
         self,
@@ -1682,9 +1780,14 @@ class MiniMaxH3DiTBlock(nn.Module):
         norm2 -> scale/shift -> MLP -> gated residual.
         """
         if adaln_params is None:
-            if self.adaln_proj is None:
+            if self.adaln_proj is not None:
+                adaln_params = self.adaln_proj(adaln_input)
+            elif self._adaln_cache_ref:
+                adaln_params = self._adaln_cache_ref[0].block_for_current_step(
+                    self.adaln_layer_index
+                )
+            else:
                 raise ValueError("MiniMax H3 AdaLN cache parameters are required")
-            adaln_params = self.adaln_proj(adaln_input)
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = adaln_params
         # Cache-DiT retains the inputs to its Fn and Mn block ranges. Only the
         # first gated residual writes to that tensor; the second one operates on
@@ -1945,6 +2048,20 @@ def _reject_adaln_lora(names: list[str]) -> None:
     )
 
 
+def _h3_checkpoint_is_quantized(quant_config: QuantizationConfig | None) -> bool:
+    """AdaLN rebuild needs source checkpoint rows, before online conversion."""
+    if quant_config is None:
+        return False
+    flags = {
+        "fp8": "is_checkpoint_fp8_serialized",
+        "mxfp8": "is_checkpoint_fp8_serialized",
+        "mxfp4": "is_checkpoint_mxfp4_serialized",
+        "mxfp4_npu": "is_checkpoint_mxfp4_npu_serialized",
+    }
+    flag = flags.get(quant_config.get_name())
+    return True if flag is None else bool(getattr(quant_config, flag, True))
+
+
 class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin):
     _aliases = (
         "MiniMaxH3Transformer3DModel",
@@ -2203,9 +2320,10 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
         arch = self.config
         if (
             adaln_cache_path is not None or adaln_weight_files is not None
-        ) and quant_config is not None:
+        ) and _h3_checkpoint_is_quantized(quant_config):
             raise ValueError(
-                "MiniMax H3 AdaLN cache is only compatible with unquantized weights"
+                "MiniMax H3 AdaLN cache requires unquantized checkpoint rows; "
+                "online quantization after loading is supported"
             )
         if arch.adaln_curve_grid is not None and (
             adaln_cache_path is not None or adaln_weight_files is not None
@@ -2345,6 +2463,10 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
             if self._adaln_precomputed
             else None
         )
+        if self.adaln_cache is not None:
+            for index, block in enumerate(self.blocks):
+                block.adaln_layer_index = index
+                block._adaln_cache_ref = (self.adaln_cache,)
         # Component overrides disappear when the loader context exits. Preserve
         # only that selection; process-wide overrides are resolved at first use.
         self._component_attention_backend_override = (
@@ -2997,7 +3119,9 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
                     adaln_cache_plan_index = self.adaln_cache.lookup(
                         unique_timesteps.view(-1).to(device)
                     )
-                block_adaln_params = self.adaln_cache.block_all(
+                # Cache-DiT forwards one set of kwargs to every cached block, so
+                # each block reads its own row of this step's slab by index.
+                self.adaln_cache.begin_step(
                     cache_plan_index=adaln_cache_plan_index,
                     num_timesteps=adaln_input.shape[0],
                 )

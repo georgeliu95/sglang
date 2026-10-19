@@ -18,7 +18,6 @@ from typing import Any, List, Literal, Optional
 
 import addict
 import yaml
-
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.attention_roles import (
     AttentionRole,
@@ -423,6 +422,10 @@ class ServerArgs(DisaggServerArgsMixin):
     # Pre-quantized transformer weights: safetensors file/directory or GGUF file.
     transformer_weights_path: str | None = None
     # path to precomputed MiniMax H3 AdaLN outputs for inference-only serving.
+    minimax_h3_ulysses_transport: str = "nccl"
+    minimax_h3_ulysses_strict: bool = False
+    minimax_h3_ulysses_max_seq_len: int = 131072
+    minimax_h3_ulysses_max_sequence_geometries: int = 4
     minimax_h3_adaln_cache_path: str | None = None
     # Rebuild AdaLN outputs per request from the checkpoint, no sidecar needed.
     minimax_h3_adaln_online: bool = False
@@ -710,6 +713,26 @@ class ServerArgs(DisaggServerArgsMixin):
         self._validate_batching()
         self._validate_breakable_cuda_graph()
         self._validate_minimax_h3_adaln()
+        if self.minimax_h3_ulysses_transport not in ("nccl", "flashinfer-pcie"):
+            raise ValueError("Unknown H3 Ulysses transport")
+        if (
+            self.minimax_h3_ulysses_strict
+            and self.minimax_h3_ulysses_transport != "flashinfer-pcie"
+            and self.component_attention_backends.get("transformer")
+            != "subblock_sparse_attn_sm120_sage_a2a"
+        ):
+            raise ValueError(
+                "H3 Ulysses strict requires flashinfer-pcie or the "
+                "prepared Sage A2A attention backend"
+            )
+        if (
+            min(
+                self.minimax_h3_ulysses_max_seq_len,
+                self.minimax_h3_ulysses_max_sequence_geometries,
+            )
+            <= 0
+        ):
+            raise ValueError("H3 Ulysses capacity must be positive")
         self.pipeline_config.validate_server_args(self)
 
     def _validate_minimax_h3_adaln(self) -> None:
@@ -2195,6 +2218,22 @@ class ServerArgs(DisaggServerArgsMixin):
                 "checkpoints use this value to select the compatible weights "
                 "without exposing repository subfolder layout."
             ),
+        )
+        parser.add_argument(
+            "--minimax-h3-ulysses-transport",
+            choices=("nccl", "flashinfer-pcie"),
+            default=ServerArgs.minimax_h3_ulysses_transport,
+        )
+        parser.add_argument(
+            "--minimax-h3-ulysses-strict", action=StoreBoolean, default=False
+        )
+        parser.add_argument(
+            "--minimax-h3-ulysses-max-seq-len",
+            type=int,
+            default=ServerArgs.minimax_h3_ulysses_max_seq_len,
+        )
+        parser.add_argument(
+            "--minimax-h3-ulysses-max-sequence-geometries", type=int, default=4
         )
         parser.add_argument(
             "--minimax-h3-adaln-online",

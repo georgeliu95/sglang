@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 import os
+import warnings
 from dataclasses import dataclass, field
 
 import torch
@@ -127,9 +128,10 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
 
     def uses_subblock_attention(self, server_args) -> bool:
         """Return whether H3 must build SubBlock-only request metadata."""
-        return (
-            self.resolve_transformer_attention_backend(server_args)
-            is AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN
+        return self.resolve_transformer_attention_backend(server_args) in (
+            AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN,
+            AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN_SM120_SAGE,
+            AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN_SM120_SAGE_A2A,
         )
 
     def validate_quality_deployment(self, server_args) -> None:
@@ -209,6 +211,28 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
             "ulysses_degree": 4,
             "use_fsdp_inference": False,
         }
+        # Experimental SM120 performance profile. It deliberately preserves the
+        # original H200 quality audit and the fixed request-shape checks.
+        sm120_profile = capability_int == 120 and server_args.num_gpus == 8
+        if sm120_profile:
+            sage = actual["component_attention_backends"].get("transformer")
+            allowed = {
+                "subblock_sparse_attn_sm120_sage",
+                "subblock_sparse_attn_sm120_sage_a2a",
+            }
+            expected.update(
+                num_gpus=8,
+                sp_degree=8,
+                ulysses_degree=8,
+                quantization="fp8",
+                video_vae_quantization={None, "fp8"},
+                component_attention_backends={
+                    "transformer": sage
+                    if sage in allowed
+                    else "subblock_sparse_attn_sm120_sage_a2a",
+                    "video_vae": "torch_cudnn_sdpa",
+                },
+            )
         mismatches = {
             name: {"expected": wanted, "actual": actual[name]}
             for name, wanted in expected.items()
@@ -218,19 +242,27 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
                 else actual[name] != wanted
             )
         }
-        if (
-            not current_platform.is_cuda()
-            or "H200" not in device_name.upper()
-            or capability_int != 90
+        if not current_platform.is_cuda() or (
+            not sm120_profile
+            and ("H200" not in device_name.upper() or capability_int != 90)
         ):
             mismatches["device"] = {
-                "expected": "NVIDIA H200 (compute capability 9.0)",
+                "expected": "8x SM120"
+                if sm120_profile
+                else "NVIDIA H200 (compute capability 9.0)",
                 "actual": f"{device_name} (compute capability {capability_int})",
             }
         if mismatches:
             raise ValueError(
-                'MiniMax-H3 quality="high" is validated only for '
-                f"the strict 4xH200 fl2va deployment; mismatches: {mismatches}"
+                'MiniMax-H3 quality="high" requires the strict 4xH200 audited '
+                f"or 8xSM120 experimental performance deployment; mismatches: {mismatches}"
+            )
+
+        if sm120_profile:
+            warnings.warn(
+                'MiniMax-H3 quality="high" on SM120 is an experimental performance '
+                "profile; the 4xH200 quality audit does not apply.",
+                RuntimeWarning,
             )
 
     def validate_server_args(self, server_args) -> None:

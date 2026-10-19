@@ -438,6 +438,7 @@ class MiniMaxH3AdalnCache(nn.Module):
         self._host_tier: MiniMaxH3AdalnHostTier | None = None
         self.stats = MiniMaxH3AdalnCacheStats()
         self.rebuilds = 0
+        self._step_block_params: tuple[tuple[torch.Tensor, ...], ...] | None = None
 
     def load(self, device: torch.device) -> None:
         if self.path is None:
@@ -736,6 +737,7 @@ class MiniMaxH3AdalnCache(nn.Module):
 
     def invalidate(self) -> None:
         """Drop every cached plan; call between requests after a weight swap."""
+        self._step_block_params = None
         if self._host_tier is not None:
             self._host_tier.synchronize()
             self._host_tier.clear()
@@ -830,6 +832,20 @@ class MiniMaxH3AdalnCache(nn.Module):
                 "MiniMax H3 AdaLN cache does not cover the request timestep plan"
             )
         return matches.to(torch.int64).argmax()
+
+    def begin_step(
+        self, *, cache_plan_index: torch.Tensor, num_timesteps: int
+    ) -> None:
+        # Cache-DiT wraps the stack and forwards identical kwargs to every
+        # layer. Publish one gathered slab; each real layer selects its row.
+        self._step_block_params = self.block_all(
+            cache_plan_index=cache_plan_index, num_timesteps=num_timesteps
+        )
+
+    def block_for_current_step(self, index: int) -> tuple[torch.Tensor, ...]:
+        if self._step_block_params is None:
+            raise ValueError("MiniMax H3 AdaLN cache: begin_step() is required")
+        return self._step_block_params[index]
 
     def block_all(
         self,

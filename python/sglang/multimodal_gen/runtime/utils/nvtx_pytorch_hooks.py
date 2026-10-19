@@ -28,9 +28,8 @@ from typing import Any
 
 import torch
 import torch.cuda.nvtx as nvtx
-from torch.utils.hooks import RemovableHandle
-
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from torch.utils.hooks import RemovableHandle
 
 logger = init_logger(__name__)
 
@@ -214,3 +213,9 @@ def _append_tensor_shapes(items: Any, shapes: list[list[int]]) -> None:
     if isinstance(items, (list, tuple)):
         for item in items:
             _append_tensor_shapes(item, shapes)
+
+
+def ulysses_nvtx_enabled():
+    import os
+
+    return os.environ.get("SGLANG_DIFFUSION_ULYSSES_NVTX", "0").lower() in ("1", "true")
