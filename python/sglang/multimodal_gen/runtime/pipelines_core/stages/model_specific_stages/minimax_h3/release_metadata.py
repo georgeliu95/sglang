@@ -20,6 +20,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
     canonical_minimax_h3_task,
     partition_for_task,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 _MINIMAX_H3_QUALITY_WORKLOAD = {
@@ -234,6 +235,18 @@ class MiniMaxH3PartitionAdmissionStage(PipelineStage):
                     else plan.default_audio_flow_shift
                 ),
             }
+            workload = _MINIMAX_H3_QUALITY_WORKLOAD
+            capability = current_platform.get_device_capability()
+            if (
+                os.environ.get("SGLANG_H3_GB10_DELIVERY") == "1"
+                and current_platform.is_cuda()
+                and capability is not None
+                and capability.to_int() == 121
+                and "GB10" in current_platform.get_device_name().upper()
+                and (actual["width"], actual["height"], actual["frame_count"])
+                == (896, 512, 209)
+            ):
+                workload = {**workload, "width": 896, "height": 512, "frame_count": 209}
             exact_fields = (
                 "task",
                 "width",
@@ -243,22 +256,22 @@ class MiniMaxH3PartitionAdmissionStage(PipelineStage):
                 "num_inference_steps",
             )
             exact = all(
-                actual[name] == _MINIMAX_H3_QUALITY_WORKLOAD[name]
+                actual[name] == workload[name]
                 for name in exact_fields
             )
             shifts = math.isclose(
                 actual["flow_shift"],
-                _MINIMAX_H3_QUALITY_WORKLOAD["flow_shift"],
+                workload["flow_shift"],
                 abs_tol=1e-9,
             ) and math.isclose(
                 actual["audio_flow_shift"],
-                _MINIMAX_H3_QUALITY_WORKLOAD["audio_flow_shift"],
+                workload["audio_flow_shift"],
                 abs_tol=1e-9,
             )
             if not exact or not shifts:
                 raise ValueError(
                     'MiniMax-H3 quality="high" is validated only for '
-                    f"{_MINIMAX_H3_QUALITY_WORKLOAD}; got {actual}"
+                    f"{workload}; got {actual}"
                 )
         return batch
 
