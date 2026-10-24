@@ -1,5 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import torch
+
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.models.vaes.minimax_h3_audio import (
     MiniMaxH3AudioVAEConfig,
 )
@@ -14,6 +17,9 @@ from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_audio_vae import (
 )
 from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae import (
     AutoencoderKLLegacy,
+)
+from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.fp8 import (
+    install_fp8_block_linears,
 )
 
 
@@ -82,9 +88,18 @@ class MiniMaxH3VideoVAE(AutoencoderKLLegacy, LayerwiseOffloadableModuleMixin):
         self.sglang_config = config
         self.use_parallel_decode = config.use_parallel_decode
         self.parallel_decode_mode = parallel_decode_mode
+        self.decoder.output_projection_input_dtype = (
+            torch.float16
+            if envs.SGLANG_DIFFUSION_MINIMAX_H3_VAE_OUTPUT_PROJECTION_FP16
+            else None
+        )
 
     def prepare_decoder_autocast_weights(self, dtype) -> int:
         return self.decoder.prepare_autocast_linear_weights(dtype)
+
+    def quantize_decoder_fp8(self) -> int:
+        """Replace the 144 decoder block linears with online FP8 modules."""
+        return install_fp8_block_linears(self.decoder)
 
 
 class MiniMaxH3AudioVAE(DacAudioVAE, LayerwiseOffloadableModuleMixin):

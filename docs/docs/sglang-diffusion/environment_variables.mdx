@@ -108,6 +108,31 @@ description: "Configure SGLang diffusion behavior with environment variables."
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>8192</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Minimum output features before <code>kitchen_int8</code> splits large-M GEMMs. Narrow outputs stay as a single call.</td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DIFFUSION_DISABLE_MINIMAX_H3_VAE_FAST_PATH</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>false</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Skip installing the quality-gated MiniMax-H3 video VAE fast path (tile and window batching, fused GroupNorm+SiLU, Q/K norm+RoPE and output kernels on SM100+); every quality level then runs the reference operators.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DIFFUSION_MINIMAX_H3_VAE_ENCODER_TILE_BATCH</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>8</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>MiniMax-H3 video VAE: encoder tiles per forward at <code>quality=extra-high</code>/<code>high</code>, <code>1</code>-<code>64</code>.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DIFFUSION_MINIMAX_H3_VAE_DECODER_TILE_BATCH</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>64</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>MiniMax-H3 video VAE: decoder tile x window x sample rows per forward, <code>1</code>-<code>64</code>. Lower it if batched activations exceed memory.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DIFFUSION_MINIMAX_H3_VAE_WINDOW_BATCH</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>1</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>MiniMax-H3 video VAE: adjacent equal-shaped decode windows per forward, <code>0</code>-<code>64</code>; <code>1</code> decodes one window at a time, <code>0</code> groups all of them (opt-in; helps on NVLink hosts, costs time and memory on PCIe hosts).</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DIFFUSION_MINIMAX_H3_VAE_OUTPUT_PROJECTION_FP16</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>false</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>MiniMax-H3 video VAE: round the decoder output-projection input to fp16 (fp32 accumulation). Read once at load; a lossy deployment-level change outside the quality tiers, independent of <code>--component-quantizations.video_vae fp8</code>.</td>
+    </tr>
   </tbody>
 </table>
 

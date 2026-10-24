@@ -7,6 +7,9 @@ from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
 )
+from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.fast_path import (
+    minimax_h3_vae_fast_path_scope,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.condition_encoding import (
     ConditionEncodingStage,
@@ -206,7 +209,14 @@ class MiniMaxH3VisualEncodingStage(ConditionEncodingStage):
                 f"{unsupported}"
             )
         # One VAE dtype toggle for every visual condition in the request.
-        with minimax_h3_scoped_encode_fp32(self.video_vae):
+        with (
+            minimax_h3_scoped_encode_fp32(self.video_vae),
+            minimax_h3_vae_fast_path_scope(
+                self.video_vae,
+                quality=batch.sampling_params.quality,
+                stage="encode",
+            ),
+        ):
             if keyframe_materials:
                 self._encode_target_keyframes(batch, plan)
             if "image.reference_preserve" in chains:

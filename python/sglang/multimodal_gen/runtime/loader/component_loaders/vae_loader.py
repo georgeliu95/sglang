@@ -9,6 +9,9 @@ from safetensors.torch import save_file as safetensors_save_file
 
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.models.vaes.base import VAEConfig
+from sglang.multimodal_gen.configs.models.vaes.minimax_h3_video import (
+    MiniMaxH3VideoVAEConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import LTX2PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImagePipelineConfig,
@@ -517,6 +520,37 @@ class VAELoader(WeightOverrideComponentLoader):
     ) -> str | None:
         return server_args.component_precisions.get(component_name)
 
+    def resolve_component_quantization_override(
+        self, server_args: ServerArgs, component_name: str
+    ) -> str | None:
+        # Only the MiniMax-H3 video decoder has an online quantizer; every
+        # other VAE keeps the fail-closed base behavior.
+        quantization = server_args.component_quantizations.get(component_name)
+        if (
+            quantization == "fp8"
+            and self.structural_component_type(component_name) in ("vae", "video_vae")
+            and isinstance(
+                server_args.pipeline_config.vae_config, MiniMaxH3VideoVAEConfig
+            )
+        ):
+            return quantization
+        return super().resolve_component_quantization_override(
+            server_args, component_name
+        )
+
+    def _quantize_decoder_if_requested(
+        self, vae, server_args: ServerArgs, component_name: str
+    ) -> None:
+        if (
+            self.resolve_component_quantization_override(server_args, component_name)
+            is None
+        ):
+            return
+        swapped = vae.quantize_decoder_fp8()
+        logger.info(
+            "VAE: %s holds %d decoder linears in online FP8", component_name, swapped
+        )
+
     def customized_load_kwargs_for_component(
         self, server_args: ServerArgs, component_name: str
     ) -> dict[str, bool]:
@@ -693,6 +727,7 @@ class VAELoader(WeightOverrideComponentLoader):
                         "VAE: converted %d Conv3d weights to channels_last_3d", n
                     )
             _hold_decoder_weights_in_decode_dtype(vae, server_args, component_name)
+            self._quantize_decoder_if_requested(vae, server_args, component_name)
             return current_platform.optimize_vae(vae)
 
         loaded = {}
@@ -758,5 +793,6 @@ class VAELoader(WeightOverrideComponentLoader):
             component_weights_path,
             component_type=component_type,
         )
+        self._quantize_decoder_if_requested(vae, server_args, component_name)
         vae = current_platform.optimize_vae(vae)
         return vae

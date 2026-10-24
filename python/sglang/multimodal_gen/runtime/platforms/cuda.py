@@ -13,8 +13,6 @@ from typing import Any, TypeVar
 
 import psutil
 import torch
-from typing_extensions import ParamSpec
-
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.platforms.interface import (
     AttentionBackendEnum,
@@ -24,6 +22,7 @@ from sglang.multimodal_gen.runtime.platforms.interface import (
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.third_party import pynvml
+from typing_extensions import ParamSpec
 
 logger = init_logger(__name__)
 
@@ -134,11 +133,10 @@ class _SlidingTileAttentionBackendResolver(_CudaAttentionBackendResolver):
     @classmethod
     def resolve(cls, platform) -> str:
         try:
-            from st_attn import sliding_tile_attention  # noqa: F401
-
             from sglang.multimodal_gen.runtime.layers.attention.backends.sliding_tile_attn import (  # noqa: F401
                 SlidingTileAttentionBackend,
             )
+            from st_attn import sliding_tile_attention  # noqa: F401
 
             return "sglang.multimodal_gen.runtime.layers.attention.backends.sliding_tile_attn.SlidingTileAttentionBackend"
         except ImportError as e:
@@ -221,12 +219,11 @@ class _SpargeAttentionBackendResolver(_CudaAttentionBackendResolver):
                 f"8.0, 8.6, 8.7, 8.9, and 9.0; found {found}."
             )
         try:
-            from spas_sage_attn import (  # noqa: F401
-                spas_sage2_attn_meansim_topk_cuda,
-            )
-
             from sglang.multimodal_gen.runtime.layers.attention.backends.sparge_attn import (  # noqa: F401
                 SpargeAttentionBackend,
+            )
+            from spas_sage_attn import (  # noqa: F401
+                spas_sage2_attn_meansim_topk_cuda,
             )
 
             return "sglang.multimodal_gen.runtime.layers.attention.backends.sparge_attn.SpargeAttentionBackend"
@@ -244,11 +241,10 @@ class _VideoSparseAttentionBackendResolver(_CudaAttentionBackendResolver):
     @classmethod
     def resolve(cls, platform) -> str:
         try:
-            from vsa import block_sparse_attn  # noqa: F401
-
             from sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn import (  # noqa: F401
                 VideoSparseAttentionBackend,
             )
+            from vsa import block_sparse_attn  # noqa: F401
 
             return "sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn.VideoSparseAttentionBackend"
         except ImportError as e:
@@ -358,6 +354,9 @@ class _SparseVideoGen2AttentionBackendResolver(_CudaAttentionBackendResolver):
     @classmethod
     def resolve(cls, platform) -> str:
         try:
+            from sglang.multimodal_gen.runtime.layers.attention.backends.sparse_video_gen_2_attn import (  # noqa: F401
+                SparseVideoGen2AttentionBackend,
+            )
             from svg.kernels.triton.permute import (  # noqa: F401
                 apply_inverse_permutation_triton,
                 permute_tensor_by_labels_triton,
@@ -367,10 +366,6 @@ class _SparseVideoGen2AttentionBackendResolver(_CudaAttentionBackendResolver):
                 density_calculation,
                 dynamic_block_sparse_fwd_flashinfer,
                 identify_dynamic_map,
-            )
-
-            from sglang.multimodal_gen.runtime.layers.attention.backends.sparse_video_gen_2_attn import (  # noqa: F401
-                SparseVideoGen2AttentionBackend,
             )
 
             return "sglang.multimodal_gen.runtime.layers.attention.backends.sparse_video_gen_2_attn.SparseVideoGen2AttentionBackend"
@@ -392,11 +387,10 @@ class _SolAttnBackendResolver(_CudaAttentionBackendResolver):
     @classmethod
     def resolve(cls, platform) -> str:
         try:
-            from sol_attn import sol_attn  # noqa: F401
-
             from sglang.multimodal_gen.runtime.layers.attention.backends.sol_attn import (  # noqa: F401
                 SolAttnBackend,
             )
+            from sol_attn import sol_attn  # noqa: F401
 
             return (
                 "sglang.multimodal_gen.runtime.layers.attention.backends.sol_attn."
@@ -417,7 +411,6 @@ class _VMOBAAttentionBackendResolver(_CudaAttentionBackendResolver):
     def resolve(cls, platform) -> str:
         try:
             from kernel.attn.vmoba_attn.vmoba import moba_attn_varlen  # noqa: F401
-
             from sglang.multimodal_gen.runtime.layers.attention.backends.vmoba import (  # noqa: F401
                 VMOBAAttentionBackend,
             )
@@ -516,6 +509,34 @@ class _FlashAttentionBackendResolver(_CudaAttentionBackendResolver):
         return AttentionBackendEnum.FA
 
 
+class _H3SageSSABackendResolver(_CudaAttentionBackendResolver):
+    backend = AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN_SM120_SAGE
+
+    @classmethod
+    def resolve(cls, platform):
+        if not platform.is_sm120():
+            raise ValueError("CAKE Sage SSA requires SM120")
+        from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse.sage_sm120 import (
+            load_bsa_attn_sm120_blk64_sage_fwd,
+        )
+
+        load_bsa_attn_sm120_blk64_sage_fwd()
+        return "sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse_attn_sm120_sage.SubBlockSparseSageAttentionSM120Backend"
+
+
+class _H3SageSSAA2ABackendResolver(_H3SageSSABackendResolver):
+    backend = AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN_SM120_SAGE_A2A
+
+    @classmethod
+    def resolve(cls, platform):
+        super().resolve(platform)
+        from flashinfer.comm import UlyssesCommunicator
+
+        if not hasattr(UlyssesCommunicator, "scatter_qkv"):
+            raise ImportError("FlashInfer prepared Sage QKV API is required")
+        return "sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse_attn_sm120_sage_a2a.SubBlockSparseSageA2AAttentionSM120Backend"
+
+
 _CUDA_ATTENTION_BACKEND_RESOLVERS = {
     resolver.backend: resolver
     for resolver in (
@@ -537,6 +558,8 @@ _CUDA_ATTENTION_BACKEND_RESOLVERS = {
         _SolAttnBackendResolver,
         _VMOBAAttentionBackendResolver,
         _SubBlockSparseAttentionBackendResolver,
+        _H3SageSSABackendResolver,
+        _H3SageSSAA2ABackendResolver,
         _FlashAttention2BackendResolver,
         _FlashAttentionBackendResolver,
     )
@@ -807,17 +830,21 @@ class CudaPlatformBase(Platform):
 
     @classmethod
     def optimize_vae(cls, vae: torch.nn.Module) -> torch.nn.Module:
-        """Install the quality-gated FLUX.2 / AutoencoderKL / Wan / Qwen-Image
-        VAE decoder fast paths.
+        """Install the quality-gated FLUX.2 / AutoencoderKL / Wan / Qwen-Image /
+        MiniMax-H3 VAE fast paths.
 
         Requests with quality="extra-high" or "high" run the fast paths; the
         "lossless" default runs the original module path bit-for-bit. See
-        flux2_vae_cuda_opt and wan_vae_cuda_opt for details.
+        flux2_vae_cuda_opt, wan_vae_cuda_opt and minimax_h3_vae_cuda_opt for
+        details.
         """
         try:
             from sglang.multimodal_gen.runtime.models.vaes.flux2_vae_cuda_opt import (
                 maybe_optimize_autoencoder_kl,
                 maybe_optimize_flux2_vae,
+            )
+            from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_vae_cuda_opt import (
+                maybe_optimize_minimax_h3_vae,
             )
             from sglang.multimodal_gen.runtime.models.vaes.wan_vae_cuda_opt import (
                 maybe_optimize_qwen_image_vae,
@@ -828,6 +855,7 @@ class CudaPlatformBase(Platform):
             vae = maybe_optimize_autoencoder_kl(vae)
             vae = maybe_optimize_wan_vae(vae)
             vae = maybe_optimize_qwen_image_vae(vae)
+            vae = maybe_optimize_minimax_h3_vae(vae)
         except Exception:
             logger.warning(
                 "Failed to apply CUDA VAE optimizations; using the unmodified VAE.",

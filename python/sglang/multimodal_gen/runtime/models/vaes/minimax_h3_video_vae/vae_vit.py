@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # ViT3D decoder for the MiniMax H3 visual VAE (inference-only bundle).
+from __future__ import annotations
+
 from contextlib import nullcontext
+from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
@@ -10,7 +13,16 @@ from diffusers.models.modeling_utils import ModelMixin
 from diffusers.utils import logging
 
 from .base_module import RotaryEmbeddingND, TransformerBlock
+from .fused_decoder import (
+    block_forward,
+    can_use_fused_decoder,
+    finish,
+    output_projection,
+)
 from .vit_utils import create_token_ids, prepare_rotary_pos_emb
+
+if TYPE_CHECKING:
+    from .fast_path import MiniMaxH3VaeFastPath
 
 logger = logging.get_logger(__name__)
 
@@ -218,6 +230,15 @@ class ViT3DDecoder(ViTBase):
 
         self._rotary_pos_emb_cache = None
         self._autocast_linear_dtype = None
+        # Filled by minimax_h3_vae_cuda_opt at load; None keeps the eager decoder.
+        self.fast_path: MiniMaxH3VaeFastPath | None = None
+        # True once fp8.install_fp8_block_linears has swapped the block linears.
+        self.fp8_installed = False
+        # torch.float16 rounds the proj_out input to half with fp32 accumulation
+        # (SGLANG_DIFFUSION_MINIMAX_H3_VAE_OUTPUT_PROJECTION_FP16); None keeps fp32.
+        self.output_projection_input_dtype: torch.dtype | None = None
+        # Rounded, transposed proj_out weight of the fp16 projection path.
+        self._proj_out_half_weight = None
 
         if len(kwargs) > 0 and (not dist.is_initialized() or dist.get_rank() == 0):
             logger.warning(f"Unused kwargs: {kwargs}")
@@ -226,6 +247,7 @@ class ViT3DDecoder(ViTBase):
         result = super()._apply(fn, recurse=recurse)
         self._rotary_pos_emb_cache = None
         self._autocast_linear_dtype = None
+        self._proj_out_half_weight = None
         return result
 
     def prepare_autocast_linear_weights(self, dtype: torch.dtype) -> int:
@@ -238,6 +260,11 @@ class ViT3DDecoder(ViTBase):
         output projections stay FP32 because their calls explicitly disable
         autocast.
         """
+
+        if self.fp8_installed:
+            if dtype != torch.float16:
+                raise ValueError("The FP8 decoder requires FP16 autocast")
+            return 0
 
         if dtype not in (torch.float16, torch.bfloat16):
             raise ValueError(
@@ -260,7 +287,30 @@ class ViT3DDecoder(ViTBase):
         self._autocast_linear_dtype = dtype
         return converted
 
+    def _run_blocks(self, hidden_states, rotary_pos_emb):
+        if can_use_fused_decoder(self, hidden_states, rotary_pos_emb):
+            for block in self.transformer_blocks:
+                hidden_states = block_forward(block, hidden_states, rotary_pos_emb)
+            return finish(hidden_states, self.norm_out)
+        hidden_states = self.forward_transformer_blocks(hidden_states, rotary_pos_emb)
+        return self.norm_out(hidden_states)
+
+    def _project_out(self, hidden_states):
+        if (
+            self.output_projection_input_dtype == torch.float16
+            and hidden_states.is_cuda
+        ):
+            output, self._proj_out_half_weight = output_projection(
+                self.proj_out, hidden_states, cache=self._proj_out_half_weight
+            )
+            if output is not None:
+                return output
+        return _linear_with_module_dtype(
+            self.proj_out, hidden_states, hidden_states.dtype
+        )
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        fast_path = self.fast_path is not None and self.fast_path.active(x)
         B, C, latent_T, latent_H, latent_W = x.shape
         patch_size = self.config.patch_size
         patch_size_t = self.config.patch_size_t
@@ -306,6 +356,7 @@ class ViT3DDecoder(ViTBase):
             x.device,
             x.dtype,
             rotary_dtype,
+            fast_path,
         )
         cache_record = self._rotary_pos_emb_cache if cache_enabled else None
         cache_hit = cache_record is not None and cache_record[0] == cache_key
@@ -329,6 +380,7 @@ class ViT3DDecoder(ViTBase):
             rotary_pos_emb = prepare_rotary_pos_emb(
                 self.pos_embed(img_ids),
                 dtype=rotary_dtype,
+                allow_batched_native=fast_path,
             )
             if cache_enabled:
                 self._rotary_pos_emb_cache = (
@@ -337,17 +389,12 @@ class ViT3DDecoder(ViTBase):
                     rotary_pos_emb,
                 )
 
-        for block in self.transformer_blocks:
-            hidden_states = block(hidden_states, rotary_pos_emb)
-
-        hidden_states = self.norm_out(hidden_states)
+        hidden_states = self._run_blocks(hidden_states, rotary_pos_emb)
 
         hidden_states = self.apply_mask_postprocess(hidden_states, num_patches)
 
         with _cuda_autocast_disabled(hidden_states):
-            output = _linear_with_module_dtype(
-                self.proj_out, hidden_states, hidden_states.dtype
-            )
+            output = self._project_out(hidden_states)
 
         output = output[:, :num_patches, :]
 

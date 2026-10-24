@@ -19,6 +19,10 @@ from .router import (
 
 __all__ = [
     "SubBlockRouter",
+    "load_bsa_attn_sm120_blk64_sage_fwd",
+    "load_quantize_sage_qkv_sm120",
     "load_bsa_attn_blk64_fwd",
     "load_bsa_attn_sm120_blk64_fwd",
 ]
+
+from .sage_sm120 import load_bsa_attn_sm120_blk64_sage_fwd, load_quantize_sage_qkv_sm120

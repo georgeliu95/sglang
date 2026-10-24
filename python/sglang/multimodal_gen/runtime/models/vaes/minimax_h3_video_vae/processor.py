@@ -1,13 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 # Tensor pre/post-processing for the MiniMax H3 visual VAE.
 import math
-from typing import Tuple
+from typing import TYPE_CHECKING, Tuple
 
 import numpy as np
 import torch
 from diffusers.utils import logging
 from einops import rearrange
 from torchvision.transforms import Normalize
+
+from sglang.kernels.ops.diffusion import (
+    can_use_minimax_h3_vae_denorm_clamp,
+    minimax_h3_vae_denorm_clamp,
+)
+
+if TYPE_CHECKING:
+    from .fast_path import MiniMaxH3VaeFastPath
 
 NORM_CONFIGS = {
     "imagenet": {
@@ -88,6 +96,8 @@ class VAEProcessor:
         )
         self.transform_rev = transform_rev or get_denormalize_transform(pixel_norm_type)
         self.use_3d_conv = use_3d_conv
+        # Filled by minimax_h3_vae_cuda_opt at load; None keeps the eager denorm.
+        self.fast_path: MiniMaxH3VaeFastPath | None = None
 
     def _ensure_list(self, data):
         return data if isinstance(data, list) else [data]
@@ -254,6 +264,17 @@ class VAEProcessor:
         return tensor.contiguous()
 
     def revert_tensor(self, tensor):
+        if (
+            self.use_3d_conv
+            and self.fast_path is not None
+            and self.fast_path.active(tensor)
+        ):
+            value = tensor.unsqueeze(2) if tensor.ndim == 4 else tensor
+            mean, std = self.transform_rev.mean, self.transform_rev.std
+            if self.fast_path.admit(
+                can_use_minimax_h3_vae_denorm_clamp(value, mean=mean, std=std)
+            ):
+                return minimax_h3_vae_denorm_clamp(value, mean=mean, std=std)
         B, T = None, None
         if self.use_3d_conv:
             tensor = tensor.unsqueeze(2) if tensor.ndim == 4 else tensor

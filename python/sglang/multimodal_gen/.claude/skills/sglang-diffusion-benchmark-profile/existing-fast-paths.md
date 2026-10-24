@@ -286,6 +286,39 @@ framework-specific optimization workflow.
   contiguity, group layout, and platform before proposing another router
   kernel.
 
+17. MiniMax-H3 video VAE batching and output kernels
+- Kernels: `group_norm_silu_ncthw`, `fused_qknorm_rope_out_of_place` (as a
+  weightless Q/K RMSNorm + NeoX RoPE), `minimax_h3_vae_assemble_tiles`,
+  `minimax_h3_vae_temporal_blend_write`, `minimax_h3_vae_denorm_clamp`.
+- Locations: `runtime/models/vaes/minimax_h3_vae_cuda_opt.py` (installer),
+  `runtime/models/vaes/minimax_h3_video_vae/fast_path.py` (gate, batch caps,
+  per-scope counters), `batching.py`, `klvae.py`, `vae_cnn.py`,
+  `attention.py`, and `processor.py` in the same package.
+- Behavior: installed at load on CUDA SM100+. `quality=extra-high` batches
+  adjacent equal-shaped decoder tiles and temporal windows and dispatches the
+  decoder-side fused kernels; `quality=high` additionally batches encoder tiles
+  and fuses the encoder GroupNorm+SiLU (caps
+  `SGLANG_DIFFUSION_MINIMAX_H3_VAE_{ENCODER_TILE,DECODER_TILE,WINDOW}_BATCH`,
+  defaults 8/64/1); `lossless` runs the reference operators. The encoder side
+  sits in the approximate tier because the denoiser amplifies conditioning
+  latent rounding changes (fl2va worst frame 28-38 dB vs 50 dB decode-only). `SGLANG_DIFFUSION_DISABLE_MINIMAX_H3_VAE_FAST_PATH=1`
+  skips the install.
+- Numerical contract: the three output kernels are bit-exact against eager.
+  GroupNorm+SiLU and Q/K norm+RoPE keep fp32 reductions but change the
+  rounding order, and batching changes cuBLAS/cuDNN algorithm selection, so
+  the whole path stays behind the quality gate.
+- Evidence: every encode/decode scope logs
+  `[H3 VAE] <stage> fast path mounted: quality=... caps=enc8/dec64/win1` and
+  `[H3 VAE] <stage> fast path: used=<n> fallback=<m>`; a non-zero fallback
+  means a kernel predicate refused a layout.
+- Validation: `test/registered/kernels/ops/diffusion/test_group_norm_silu_ncthw.py`,
+  `test_minimax_h3_vae_output.py`, `test_qknorm_rope_out_of_place.py`, and
+  `multimodal_gen/test/unit/test_minimax_h3_vae_fast_path.py`.
+- Workflow rule: if an H3 decode trace at `extra-high` still shows separate
+  `group_norm` + `silu` or `rms_norm` + `rotary_embedding` launches, check the
+  mount log line, the SM gate, and the fallback count before proposing another
+  kernel.
+
 **Faster CUDA Kernel Usage Points**
 
 1. sgl-kernel RMSNorm and fused add RMSNorm

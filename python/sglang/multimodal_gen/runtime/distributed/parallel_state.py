@@ -37,12 +37,11 @@ import os
 from contextlib import contextmanager
 from typing import List, Optional
 
+import sglang.multimodal_gen.envs as envs
 import torch
 import torch.distributed
-from torch.distributed import ProcessGroup
-
-import sglang.multimodal_gen.envs as envs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from torch.distributed import ProcessGroup
 
 from .group_coordinator import (
     GroupCoordinator,
@@ -932,6 +931,11 @@ def destroy_model_parallel() -> None:
     from .parallel_groups import PROCESS_GROUP
 
     IPC_A2A.reset()
+    from .device_communicators.flashinfer_ulysses_a2a import (
+        shutdown_flashinfer_ulysses_a2a,
+    )
+
+    shutdown_flashinfer_ulysses_a2a()
 
     destroyed_groups = []
     for group in (

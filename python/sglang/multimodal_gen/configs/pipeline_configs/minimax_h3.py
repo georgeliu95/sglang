@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 import os
+import warnings
 from dataclasses import dataclass, field
 
 import torch
 
+from sglang.kernels.ops.diffusion.common.platform import is_cuda_sm_at_least
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.models.dits.minimax_h3 import MiniMaxH3DiTConfig
 from sglang.multimodal_gen.configs.models.encoders.minimax_h3_qwen3vl import (
     MiniMaxH3Qwen3VLConfig,
@@ -23,11 +26,13 @@ from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config impo
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
     LAYERWISE_OFFLOAD,
+    RESIDENT,
 )
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
+from sglang.multimodal_gen.runtime.utils.precision import resolve_decode_precision
 
 
 @dataclass
@@ -122,9 +127,10 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
 
     def uses_subblock_attention(self, server_args) -> bool:
         """Return whether H3 must build SubBlock-only request metadata."""
-        return (
-            self.resolve_transformer_attention_backend(server_args)
-            is AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN
+        return self.resolve_transformer_attention_backend(server_args) in (
+            AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN,
+            AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN_SM120_SAGE,
+            AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN_SM120_SAGE_A2A,
         )
 
     def validate_quality_deployment(self, server_args) -> None:
@@ -166,6 +172,12 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
             "quantization": server_args.quantization,
             "transformer_weights_path": server_args.transformer_weights_path,
             "text_encoder_quantization": text_encoder_quantization,
+            "video_vae_quantization": server_args.component_quantizations.get(
+                "video_vae"
+            ),
+            "video_vae_output_projection_fp16": (
+                envs.SGLANG_DIFFUSION_MINIMAX_H3_VAE_OUTPUT_PROJECTION_FP16
+            ),
             "regional_compile": server_args.regional_compile,
             "ring_degree": server_args.ring_degree,
             "sp_degree": server_args.sp_degree,
@@ -189,6 +201,8 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
             "quantization": None,
             "transformer_weights_path": None,
             "text_encoder_quantization": None,
+            "video_vae_quantization": None,
+            "video_vae_output_projection_fp16": False,
             "regional_compile": False,
             "ring_degree": 1,
             "sp_degree": 4,
@@ -196,6 +210,28 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
             "ulysses_degree": 4,
             "use_fsdp_inference": False,
         }
+        # Experimental SM120 performance profile. It deliberately preserves the
+        # original H200 quality audit and the fixed request-shape checks.
+        sm120_profile = capability_int == 120 and server_args.num_gpus == 8
+        if sm120_profile:
+            sage = actual["component_attention_backends"].get("transformer")
+            allowed = {
+                "subblock_sparse_attn_sm120_sage",
+                "subblock_sparse_attn_sm120_sage_a2a",
+            }
+            expected.update(
+                num_gpus=8,
+                sp_degree=8,
+                ulysses_degree=8,
+                quantization="fp8",
+                video_vae_quantization={None, "fp8"},
+                component_attention_backends={
+                    "transformer": sage
+                    if sage in allowed
+                    else "subblock_sparse_attn_sm120_sage_a2a",
+                    "video_vae": "torch_cudnn_sdpa",
+                },
+            )
         mismatches = {
             name: {"expected": wanted, "actual": actual[name]}
             for name, wanted in expected.items()
@@ -205,24 +241,40 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
                 else actual[name] != wanted
             )
         }
-        if (
-            not current_platform.is_cuda()
-            or "H200" not in device_name.upper()
-            or capability_int != 90
+        if not current_platform.is_cuda() or (
+            not sm120_profile
+            and ("H200" not in device_name.upper() or capability_int != 90)
         ):
             mismatches["device"] = {
-                "expected": "NVIDIA H200 (compute capability 9.0)",
+                "expected": "8x SM120"
+                if sm120_profile
+                else "NVIDIA H200 (compute capability 9.0)",
                 "actual": f"{device_name} (compute capability {capability_int})",
             }
         if mismatches:
             raise ValueError(
-                'MiniMax-H3 quality="high" is validated only for '
-                f"the strict 4xH200 fl2va deployment; mismatches: {mismatches}"
+                'MiniMax-H3 quality="high" requires the strict 4xH200 audited '
+                f"or 8xSM120 experimental performance deployment; mismatches: {mismatches}"
+            )
+
+        if sm120_profile:
+            warnings.warn(
+                'MiniMax-H3 quality="high" on SM120 is an experimental performance '
+                "profile; the 4xH200 quality audit does not apply.",
+                RuntimeWarning,
             )
 
     def validate_server_args(self, server_args) -> None:
+        from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.fast_path import (
+            resolve_minimax_h3_vae_batch_caps,
+        )
+
         # Reject known-inexact VAE modes before any large component download.
         self.vae_config.resolved_parallel_decode_mode()
+        # Out-of-range SGLANG_DIFFUSION_MINIMAX_H3_VAE_*_BATCH values fail here;
+        # optimize_vae would otherwise swallow them as a load-time warning.
+        resolve_minimax_h3_vae_batch_caps()
+        self._validate_video_vae_quantization(server_args)
         if current_platform.is_mps():
             required_components = (
                 "transformer",
@@ -311,6 +363,36 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
             selected_attention_backend=selected_backend,
             attention_requirements=AttentionRequirements(packed_varlen=True),
         )
+
+    @staticmethod
+    def _validate_video_vae_quantization(server_args) -> None:
+        quantization = server_args.component_quantizations.get("video_vae")
+        if quantization is None:
+            return
+        if quantization != "fp8":
+            raise ValueError(
+                "MiniMax-H3 video_vae supports only "
+                f"--component-quantizations.video_vae fp8, got {quantization!r}"
+            )
+        if not (current_platform.is_cuda() and is_cuda_sm_at_least((10, 0))):
+            raise ValueError(
+                "The MiniMax-H3 online FP8 video VAE decoder requires CUDA "
+                "compute capability 10.0 or newer"
+            )
+        if (
+            resolve_decode_precision(server_args, "video_vae") != torch.float16
+            or server_args.disable_autocast
+        ):
+            raise ValueError(
+                "The MiniMax-H3 online FP8 video VAE decoder requires the fp16 "
+                "decode autocast recipe; drop --component-precisions.video_vae "
+                "and --disable-autocast"
+            )
+        if server_args.residency_mode("video_vae") != RESIDENT:
+            raise ValueError(
+                "The MiniMax-H3 online FP8 video VAE decoder requires a resident "
+                "decoder; pass --component-residency video_vae=resident"
+            )
 
     def select_vae_weight_files(
         self,

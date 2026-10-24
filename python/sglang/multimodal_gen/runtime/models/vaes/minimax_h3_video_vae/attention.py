@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # Attention module for the MiniMax H3 visual VAE (inference-only bundle).
+from __future__ import annotations
+
 from contextlib import nullcontext
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import torch
 import torch.distributed as dist
@@ -10,6 +12,10 @@ import torch.nn.functional as F
 from diffusers.utils import logging
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
+from sglang.kernels.ops.diffusion import (
+    can_use_fused_inplace_qknorm_rope,
+    fused_qknorm_rope_out_of_place,
+)
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
@@ -17,6 +23,9 @@ from sglang.multimodal_gen.runtime.platforms import (
 )
 
 from .vit_utils import _env_flag, apply_rotary_pos_emb_qk
+
+if TYPE_CHECKING:
+    from .fast_path import MiniMaxH3VaeFastPath
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 _FORCE_ROCM_MATH_SDPA = current_platform.is_rocm() and "gfx95" in str(
@@ -59,6 +68,14 @@ def _apply_qk_norm(module, hidden_states):
         with torch.autocast("cuda", enabled=False):
             return module(hidden_states)
     return module(_vit_norm_input(module, hidden_states)).to(hidden_states.dtype)
+
+
+def _weightless_rmsnorm(module) -> bool:
+    return (
+        isinstance(module, nn.RMSNorm)
+        and module.weight is None
+        and module.eps is not None
+    )
 
 
 class Attention(nn.Module):
@@ -116,6 +133,7 @@ class Attention(nn.Module):
                 supported_attention_backends={
                     AttentionBackendEnum.FA,
                     AttentionBackendEnum.TORCH_SDPA,
+                    AttentionBackendEnum.TORCH_CUDNN_SDPA,
                 },
                 default_attention_backend=AttentionBackendEnum.TORCH_SDPA,
                 skip_sequence_parallel=True,
@@ -123,9 +141,71 @@ class Attention(nn.Module):
             if current_platform.is_cuda()
             else None
         )
+        # Filled by minimax_h3_vae_cuda_opt at load; None keeps the eager QK norm+RoPE.
+        self.fast_path: MiniMaxH3VaeFastPath | None = None
+        # Unit norm weights per (device, dtype) for the weightless fused kernel.
+        self._qk_norm_ones: dict[tuple[torch.device, torch.dtype], torch.Tensor] = {}
 
         if len(kwargs) > 0 and (not dist.is_initialized() or dist.get_rank() == 0):
             logger.warning(f"Unused kwargs: {kwargs}")
+
+    def _unit_norm_weight(self, like: torch.Tensor) -> torch.Tensor:
+        key = (like.device, like.dtype)
+        ones = self._qk_norm_ones.get(key)
+        if ones is None:
+            ones = torch.ones(self.dim_head, dtype=like.dtype, device=like.device)
+            self._qk_norm_ones[key] = ones
+        return ones
+
+    def _paired_qk(self, qkv: torch.Tensor, rotary_pos_emb):
+        """Fused weightless RMSNorm + NeoX RoPE over Q and K; None when not applicable."""
+        if not (
+            self.fast_path is not None
+            and self.fast_path.active(qkv)
+            and len(rotary_pos_emb) == 4
+            and _weightless_rmsnorm(self.norm_q)
+            and _weightless_rmsnorm(self.norm_k)
+            and self.norm_q.eps == self.norm_k.eps
+        ):
+            return None
+        cache, positions = rotary_pos_emb[2], rotary_pos_emb[3]
+        rows = qkv.shape[0] * qkv.shape[1]
+        # Compact NeoX cache [cos_half | sin_half]; its width is the rotary dim.
+        rope_dim = cache.shape[-1]
+        if not self.fast_path.admit(
+            cache.shape[0] == rows
+            and can_use_fused_inplace_qknorm_rope(
+                self.dim_head, rope_dim, True, qkv.dtype, cache.dtype, True
+            )
+        ):
+            return None
+        flat = qkv.view(rows, self.heads, 3 * self.dim_head)
+        q_out = torch.empty(
+            (rows, self.heads, self.dim_head), dtype=qkv.dtype, device=qkv.device
+        )
+        k_out = torch.empty_like(q_out)
+        ones = self._unit_norm_weight(qkv)
+        fused_qknorm_rope_out_of_place(
+            flat[:, :, : self.dim_head],
+            flat[:, :, self.dim_head : 2 * self.dim_head],
+            q_out,
+            k_out,
+            ones,
+            ones,
+            cache,
+            positions,
+            is_neox=True,
+            eps=self.norm_q.eps,
+            head_dim=self.dim_head,
+            rope_dim=rope_dim,
+            round_norm_before_rope=True,
+        )
+        head_shape = (*qkv.shape[:2], self.heads, self.dim_head)
+        return (
+            q_out.view(head_shape),
+            k_out.view(head_shape),
+            qkv[..., 2 * self.dim_head :],
+        )
 
     def forward(
         self,
@@ -136,15 +216,19 @@ class Attention(nn.Module):
 
         qkv = self.to_qkv(hidden_states)
         qkv = qkv.view(batch_size, seq_len, -1, 3 * self.dim_head)
-        query, key, value = torch.chunk(qkv, 3, dim=-1)
+        fused = None if rotary_pos_emb is None else self._paired_qk(qkv, rotary_pos_emb)
+        if fused is not None:
+            query, key, value = fused
+        else:
+            query, key, value = torch.chunk(qkv, 3, dim=-1)
 
-        if self.norm_q is not None:
-            query = _apply_qk_norm(self.norm_q, query)
-        if self.norm_k is not None:
-            key = _apply_qk_norm(self.norm_k, key)
+            if self.norm_q is not None:
+                query = _apply_qk_norm(self.norm_q, query)
+            if self.norm_k is not None:
+                key = _apply_qk_norm(self.norm_k, key)
 
-        if rotary_pos_emb is not None:
-            query, key = apply_rotary_pos_emb_qk(query, key, rotary_pos_emb)
+            if rotary_pos_emb is not None:
+                query, key = apply_rotary_pos_emb_qk(query, key, rotary_pos_emb)
 
         if self.attn is not None and query.dtype in (torch.float16, torch.bfloat16):
             hidden_states = self.attn(query, key, value)

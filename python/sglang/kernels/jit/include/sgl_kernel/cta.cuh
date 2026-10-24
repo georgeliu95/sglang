@@ -39,6 +39,36 @@ SGL_DEVICE void reduce_max(T value, float* smem, float min_value = 0.0f) {
   // no extra sync; it is caller's responsibility to sync if needed
 }
 
+/**
+ * \brief Compute the sum of `value` across all threads in the CTA.
+ *
+ * Same two-level scheme and shared-memory contract as `reduce_max`: each warp
+ * reduces via `warp::reduce_sum`, publishes its partial to `smem[warp_id]`,
+ * and warp 0 folds the partials into `smem[0]`.
+ *
+ * \tparam T Numeric type (must be supported by `warp::reduce_sum`).
+ * \param value Per-thread input value.
+ * \param smem Shared memory buffer (must have at least `blockDim.x / 32`
+ *             elements).
+ * \param identity Identity element for the sum (default 0.0f), read by the
+ *                 lanes of warp 0 that have no warp partial to fold.
+ * \note This function does NOT issue a trailing `__syncthreads()`.
+ *       Callers must synchronize before reading `smem[0]`, and once more
+ *       before reusing the same `smem` for another reduction.
+ */
+template <typename T>
+SGL_DEVICE void reduce_sum(T value, float* smem, float identity = 0.0f) {
+  const uint32_t warp_id = threadIdx.x / kWarpThreads;
+  smem[warp_id] = warp::reduce_sum(value);
+  __syncthreads();
+  if (warp_id == 0) {
+    const auto tx = threadIdx.x;
+    const auto local_value = tx * kWarpThreads < blockDim.x ? smem[tx] : identity;
+    smem[0] = warp::reduce_sum(local_value);
+  }
+  // no extra sync; it is caller's responsibility to sync if needed
+}
+
 }  // namespace device::cta
 
 }  // namespace sglang

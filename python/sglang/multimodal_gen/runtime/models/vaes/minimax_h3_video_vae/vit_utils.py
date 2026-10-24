@@ -115,6 +115,7 @@ def prepare_rotary_pos_emb(
     rotary_pos_emb: Tuple[torch.Tensor, torch.Tensor],
     *,
     dtype: torch.dtype,
+    allow_batched_native: bool = False,
 ) -> tuple[torch.Tensor, ...]:
     """Prebuild the native Q/K rotary cache once per ViT decoder forward."""
     cos, sin = rotary_pos_emb
@@ -123,7 +124,7 @@ def prepare_rotary_pos_emb(
         or dtype not in (torch.float16, torch.bfloat16)
         or cos.shape != sin.shape
         or cos.dim() != 4
-        or cos.shape[0] != 1
+        or (cos.shape[0] != 1 and not allow_batched_native)
         or cos.shape[2] != 1
         or cos.shape[-1] % 2
         or _env_flag("MINIMAX_H3_VAE_DECODER_VIT_ROPE_TORCH_COMPILE", "0")
@@ -136,11 +137,11 @@ def prepare_rotary_pos_emb(
     # RotaryEmbeddingND repeats each half. The native kernel consumes the
     # compact NeoX cache [cos_half | sin_half].
     cache = torch.cat(
-        (cos[0, :, 0, :half], sin[0, :, 0, :half]),
+        (cos[:, :, 0, :half].reshape(-1, half), sin[:, :, 0, :half].reshape(-1, half)),
         dim=-1,
     ).contiguous()
     positions = torch.arange(
-        cos.shape[1],
+        cos.shape[0] * cos.shape[1],
         dtype=torch.long,
         device=cos.device,
     )
@@ -222,7 +223,6 @@ def apply_rotary_pos_emb_qk(
         and query.dtype == key.dtype
         and query.dtype in (torch.float16, torch.bfloat16)
         and query.dim() == 4
-        and query.shape[0] == 1
         and not torch.compiler.is_compiling()
     ):
         _, _, cache, positions = rotary_pos_emb
@@ -230,10 +230,10 @@ def apply_rotary_pos_emb_qk(
             cache.is_cuda
             and cache.dtype == query.dtype
             and cache.dim() == 2
-            and cache.shape[0] == query.shape[1]
+            and cache.shape[0] == query.shape[0] * query.shape[1]
             and cache.shape[1] <= query.shape[-1]
             and positions.is_cuda
-            and positions.shape == (query.shape[1],)
+            and positions.shape == (query.shape[0] * query.shape[1],)
         ):
             from sgl_kernel import rotary_embedding
 
@@ -241,8 +241,8 @@ def apply_rotary_pos_emb_qk(
             key = key.contiguous()
             rotary_embedding(
                 positions,
-                query.view(query.shape[1], -1),
-                key.view(key.shape[1], -1),
+                query.view(query.shape[0] * query.shape[1], -1),
+                key.view(key.shape[0] * key.shape[1], -1),
                 query.shape[-1],
                 cache,
                 True,

@@ -64,7 +64,7 @@ from sglang.kernels.ops.diffusion import (
     unmount_qwen_image_added_qkv,
     wan_rmsnorm_silu,
 )
-from sglang.kernels.ops.diffusion.common.platform import is_cuda
+from sglang.kernels.ops.diffusion.common.platform import is_cuda, is_cuda_sm_at_least
 from sglang.multimodal_gen.configs.models.vaes.stablediffusion3 import (
     StableDiffusion3VAEConfig,
 )
@@ -129,7 +129,46 @@ from sglang.multimodal_gen.runtime.models.vaes import (
     wanvae,
 )
 from sglang.multimodal_gen.runtime.models.vaes.autoencoder import AutoencoderKL
-from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import use_vae_fast_path
+from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import (
+    register_vae_fast_path_gate,
+    use_vae_fast_path,
+)
+from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_vae_cuda_opt import (
+    _install_fast_path_slots,
+)
+from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae import (
+    AutoencoderKLLegacy,
+)
+from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae import (
+    attention as h3_attention,
+)
+from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae import (
+    klvae as h3_klvae,
+)
+from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae import (
+    processor as h3_processor,
+)
+from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae import (
+    vae_cnn as h3_vae_cnn,
+)
+from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.attention import (
+    Attention as H3Attention,
+)
+from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.base_module import (
+    RotaryEmbeddingND,
+)
+from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.fast_path import (
+    MiniMaxH3VaeFastPath,
+)
+from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.norm import (
+    SpatialNorm3D,
+    TemporalIsolatedGroupNorm,
+)
+from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.vit_utils import (
+    apply_rotary_pos_emb_qk,
+    create_token_ids,
+    prepare_rotary_pos_emb,
+)
 from sglang.multimodal_gen.runtime.models.vaes.wan_vae_cuda_opt import (
     FusedWanRMSNormSiLU,
     GatedChannelsLastUpsample,
@@ -141,6 +180,8 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=95, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+# The MiniMax-H3 VAE section only runs on SM100+.
+register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 register_amd_ci(est_time=8, suite="nightly-amd-kernel-1-gpu", nightly=True)
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -1571,6 +1612,354 @@ def test_qwen21_modulation_does_not_verify_during_capture(monkeypatch):
     scale.normal_()
     graph.replay()
     assert torch.equal(out, norm(x) * (1 + scale))
+
+
+# ---------------------------------------------------------------------------
+# MiniMax-H3 video VAE -- quality-gated fast path wiring (SM100+)
+# ---------------------------------------------------------------------------
+
+requires_h3_kernels = pytest.mark.skipif(
+    not is_cuda_sm_at_least((10, 0)),
+    reason="the MiniMax-H3 VAE fast path needs CUDA SM100 or newer",
+)
+
+_H3_ATTENTION_MODULE = (
+    "sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.attention"
+)
+
+
+def _h3_tiny_vae() -> AutoencoderKLLegacy:
+    """Two-level 3D CNN encoder and one-block ViT decoder; 32 px tiles of 16.
+
+    Same recipe as the CPU unit tests. ``current_platform.is_cuda`` is patched
+    off during construction so the block attention keeps the plain SDPA path
+    instead of building a USPAttention that needs server args."""
+    torch.manual_seed(0)
+    with patch(f"{_H3_ATTENTION_MODULE}.current_platform.is_cuda", return_value=False):
+        vae = AutoencoderKLLegacy(
+            in_channels=3,
+            out_ch=3,
+            ch=32,
+            embed_dim=4,
+            z_channels=4,
+            use_3d_conv=True,
+            num_res_blocks=1,
+            ch_mult=[1, 1],
+            space_down=[2, 1],
+            space_up=[1, 2],
+            time_down=[1, 1],
+            padding_mode="reflect",
+            use_t_isolated_gn=True,
+            causal_encoder=True,
+            causal_decoder=False,
+            use_vit_decoder=True,
+            vit_decoder_kwargs={
+                "dim_head": 16,
+                "heads": 2,
+                "num_layers": 1,
+                "norm_type": "rms_norm",
+                "qk_norm_type": "rms_norm",
+                "qk_norm_affine": False,
+                "ffn_activation_fn": "silu",
+                "ffn_use_gated": True,
+                "rope_dim_ratio": 0.75,
+                "rope_theta": 100.0,
+                "num_register_tokens": 1,
+            },
+            clip_length=4,
+            token_drop=1,
+            encoder_tiling=True,
+            decoder_tiling=True,
+            tile_size=16,
+            tile_overlap_min=4,
+        )
+    for parameter in vae.parameters():
+        parameter.data.normal_(0, 0.2)
+    return vae.eval()
+
+
+def _h3_install(vae, *, caps=(8, 64, 0)) -> MiniMaxH3VaeFastPath:
+    encoder_tile_batch, decoder_tile_batch, window_batch = caps
+    state = MiniMaxH3VaeFastPath(
+        gate=VaeFastPathGate(),
+        encoder_tile_batch=encoder_tile_batch,
+        decoder_tile_batch=decoder_tile_batch,
+        window_batch=window_batch,
+    )
+    _install_fast_path_slots(vae, state)
+    register_vae_fast_path_gate(vae, state.gate)
+    return state
+
+
+def _ulp_distance_16bit(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Representable steps between two 16-bit float tensors of one dtype; +-0 coincide."""
+
+    def key(t: torch.Tensor) -> torch.Tensor:
+        bits = t.contiguous().view(torch.int16).to(torch.int32) & 0xFFFF
+        return torch.where(bits >= 0x8000, -(bits - 0x8000), bits)
+
+    return (key(a) - key(b)).abs()
+
+
+@requires_h3_kernels
+@torch.no_grad()
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_minimax_h3_paired_qk_engages_and_matches_eager_chain(dtype):
+    """Under an active gate ``Attention._paired_qk`` runs the weightless
+    ``fused_qknorm_rope_out_of_place`` once and hands back Q/K/V; the fused Q/K
+    are torch.equal to ``fused_inplace_qknorm`` + ``sgl_kernel.rotary_embedding``
+    and, against the module's own eager chain (``_apply_qk_norm`` +
+    ``apply_rotary_pos_emb_qk``), within one 16-bit ulp at the norm stage and one
+    ulp of the largest normalized operand after RoPE (aten's RMSNorm reduces in a
+    different fp32 order; RoPE preserves that absolute error)."""
+    from sgl_kernel import rotary_embedding
+
+    from sglang.kernels.ops.layernorm.norm import fused_inplace_qknorm
+
+    heads, dim_head = 2, 64
+    with patch(f"{_H3_ATTENTION_MODULE}.current_platform.is_cuda", return_value=False):
+        attention = H3Attention(
+            heads, dim_head, qk_norm_type="rms_norm", qk_norm_affine=False
+        )
+    attention = attention.to("cuda", dtype).eval()
+    state = MiniMaxH3VaeFastPath(
+        gate=VaeFastPathGate(),
+        encoder_tile_batch=8,
+        decoder_tile_batch=64,
+        window_batch=0,
+    )
+    attention.fast_path = state
+
+    batch, frames, height, width = 2, 2, 3, 5
+    tokens = frames * height * width
+    generator = torch.Generator(device="cpu").manual_seed(0)
+    qkv = torch.randn(batch, tokens, heads, 3 * dim_head, generator=generator)
+    qkv[..., :dim_head].mul_(0.3)
+    qkv[..., dim_head : 2 * dim_head].mul_(7)
+    qkv = qkv.to("cuda", dtype)
+    # The decoder's own rotary tables: 48 rotary dims of 64, 3-D coordinates.
+    pos_embed = RotaryEmbeddingND(48, 100.0, n_dim=3, use_angle=True).cuda()
+    ids = create_token_ids((frames, height, width), "cuda", dtype).expand(batch, -1, -1)
+    rope = prepare_rotary_pos_emb(
+        pos_embed(ids), dtype=dtype, allow_batched_native=True
+    )
+    assert len(rope) == 4 and rope[2].shape == (batch * tokens, 48)
+
+    # Gate off: the eager path stays in charge and nothing is counted.
+    assert attention._paired_qk(qkv, rope) is None
+    assert state.used == 0 and state.fallback == 0
+
+    state.gate.enabled = True
+    with patch.object(
+        h3_attention,
+        "fused_qknorm_rope_out_of_place",
+        wraps=h3_attention.fused_qknorm_rope_out_of_place,
+    ) as fused:
+        fused_out = attention._paired_qk(qkv, rope)
+    assert fused_out is not None and fused.call_count == 1
+    assert state.used == 1 and state.fallback == 0
+    query, key, value = fused_out
+    assert query.shape == key.shape == (batch, tokens, heads, dim_head)
+    assert torch.equal(value, qkv[..., 2 * dim_head :])
+
+    # Chain 1: the JIT weightless RMSNorm plus the AOT rotary kernel, bitwise.
+    ones = torch.ones(dim_head, device="cuda", dtype=dtype)
+    q_jit = qkv[..., :dim_head].reshape(batch * tokens, heads, dim_head).contiguous()
+    k_jit = qkv[..., dim_head : 2 * dim_head].reshape(-1, heads, dim_head).contiguous()
+    fused_inplace_qknorm(
+        q_jit, k_jit, ones, ones, attention.norm_q.eps, head_dim=dim_head
+    )
+    q_ref, k_ref = q_jit.clone(), k_jit.clone()
+    rotary_embedding(rope[3], q_ref, k_ref, dim_head, rope[2], True)
+    assert torch.equal(query.reshape(-1, heads, dim_head), q_ref)
+    assert torch.equal(key.reshape(-1, heads, dim_head), k_ref)
+
+    # Chain 2: what Attention.forward runs when _paired_qk returns None.
+    query_eager, key_eager, _ = torch.chunk(qkv, 3, dim=-1)
+    query_norm = h3_attention._apply_qk_norm(attention.norm_q, query_eager)
+    key_norm = h3_attention._apply_qk_norm(attention.norm_k, key_eager)
+    for jit_norm, aten_norm in ((q_jit, query_norm), (k_jit, key_norm)):
+        assert (
+            int(_ulp_distance_16bit(jit_norm, aten_norm.reshape_as(jit_norm)).max())
+            <= 1
+        )
+    one_ulp = torch.finfo(dtype).eps * max(
+        query_norm.abs().max().item(), key_norm.abs().max().item()
+    )
+    query_eager, key_eager = apply_rotary_pos_emb_qk(query_norm, key_norm, rope)
+    for actual, expected in ((query, query_eager), (key, key_eager)):
+        assert (actual.float() - expected.float()).abs().max().item() <= one_ulp
+
+
+@requires_h3_kernels
+@torch.no_grad()
+@pytest.mark.parametrize("layout", ["frame_views", "stacked_buffer"])
+def test_minimax_h3_assemble_tiles_fast_path_is_bit_exact(layout):
+    """``_assemble_tiles`` with the gate on routes a 2x3 grid whose overlaps
+    ``split_tiles`` made uneven ([4] rows, [6, 4] columns) through the kernel,
+    bitwise equal to the eager blend/crop/copy chain of the same tiles."""
+    vae = _h3_tiny_vae().cuda()
+    state = _h3_install(vae)
+    height, width = 28, 38
+    y_idx, y_len, y_overlap = vae.split_tiles(height, is_decoder=True)
+    x_idx, x_len, x_overlap = vae.split_tiles(width, is_decoder=True)
+    assert (len(y_idx), len(x_idx)) == (2, 3) and x_overlap == [6, 4]
+
+    if layout == "frame_views":
+        # Tiles as views into one frame, like tiled_decode slices its input.
+        frame = torch.randn(1, 3, 2, height, width, device="cuda")
+        rows = [
+            [frame[..., y0 : y0 + h, x0 : x0 + w] for x0, w in zip(x_idx, x_len)]
+            for y0, h in zip(y_idx, y_len)
+        ]
+    else:
+        # Tiles as slices of one batched decoder output (as_strided stack).
+        buffer = torch.randn(6, 1, 3, 2, 16, 16, device="cuda")
+        rows = [list(buffer[:3].unbind(0)), list(buffer[3:].unbind(0))]
+
+    with use_vae_fast_path(vae, False):
+        eager = vae._assemble_tiles(rows, y_overlap, x_overlap)
+    with (
+        use_vae_fast_path(vae, True),
+        patch.object(
+            h3_klvae,
+            "minimax_h3_vae_assemble_tiles",
+            wraps=h3_klvae.minimax_h3_vae_assemble_tiles,
+        ) as fused,
+    ):
+        fast = vae._assemble_tiles(rows, y_overlap, x_overlap)
+    assert fused.call_count == 1 and state.used == 1 and state.fallback == 0
+    assert fast.shape == (1, 3, 2, height, width) and fast.is_contiguous()
+    assert torch.equal(fast, eager)
+
+
+@requires_h3_kernels
+@torch.no_grad()
+def test_minimax_h3_norm_silu_engages_only_without_cond():
+    """``norm_silu`` dispatches ``group_norm_silu_ncthw`` only for a plain
+    GroupNorm with no conditioning under an active gate; the spatial norm with
+    ``zq`` and the gate-off call keep the eager operators bit for bit."""
+    state = MiniMaxH3VaeFastPath(
+        gate=VaeFastPathGate(),
+        encoder_tile_batch=8,
+        decoder_tile_batch=64,
+        window_batch=0,
+    )
+    state.gate.enabled = True
+    x = torch.randn(2, 64, 3, 8, 12, device="cuda")
+    norms = [
+        TemporalIsolatedGroupNorm(32, 64, eps=1e-6, affine=True),
+        nn.GroupNorm(32, 64, eps=1e-6, affine=True),
+    ]
+    for norm in norms:
+        norm.weight.normal_()
+        norm.bias.normal_()
+        norm.cuda()
+        with patch.object(
+            h3_vae_cnn, "group_norm_silu_ncthw", wraps=h3_vae_cnn.group_norm_silu_ncthw
+        ) as fused:
+            fast = h3_vae_cnn.norm_silu(x, norm, fast_path=state)
+        assert fused.call_count == 1
+        # Close contract (fp32 reduction order), the same budget as the kernel test.
+        torch.testing.assert_close(fast, F.silu(norm(x)), atol=4e-5, rtol=3e-5)
+        # Gate off, or no fast path installed: eager, and nothing is counted.
+        state.gate.enabled = False
+        assert torch.equal(
+            h3_vae_cnn.norm_silu(x, norm, fast_path=state), F.silu(norm(x))
+        )
+        assert torch.equal(h3_vae_cnn.norm_silu(x, norm), F.silu(norm(x)))
+        state.gate.enabled = True
+    assert state.used == 2 and state.fallback == 0
+
+    spatial = SpatialNorm3D(64, 4, causal=True, use_t_isolated_gn=True).cuda()
+    zq = torch.randn(2, 4, 3, 8, 12, device="cuda")
+    with patch.object(
+        h3_vae_cnn, "group_norm_silu_ncthw", wraps=h3_vae_cnn.group_norm_silu_ncthw
+    ) as fused:
+        conditioned = h3_vae_cnn.norm_silu(x, spatial, zq, fast_path=state)
+    assert fused.call_count == 0
+    assert torch.equal(conditioned, F.silu(spatial(x, zq)))
+    # The conditioned site never reaches the kernel predicate, so no fallback tally.
+    assert state.used == 2 and state.fallback == 0
+
+
+@requires_h3_kernels
+@torch.no_grad()
+@pytest.mark.parametrize("capacity", [2, 4, 8])
+def test_minimax_h3_batching_is_close_but_not_bit_identical(capacity):
+    """Tile/window batching vs one-at-a-time forwards on the tiny VAE under fp16
+    autocast, same kernels on both sides (gate on, kernel predicates refused, so
+    only the leading dimension changes).
+
+    Bit-identity does NOT hold: cuBLAS/cuDNN pick algorithms by batch size.
+    Measured on an RTX 3080 Ti (SM86): capacity 2 moves the fp32 decoded frames
+    by 2.4e-7 (one ulp at |x| <= 1.08), capacities 4 and 8 by 8.3e-5; capacity 8
+    also flips one fp16 ulp (1.95e-3) in the encoder latent. Each configuration
+    is deterministic run to run, so the differences are algorithm choice, not
+    races. The bound below is one fp16 ulp of the operands."""
+    vae = _h3_tiny_vae().cuda()
+    state = _h3_install(vae, caps=(1, 1, 1))
+    x = torch.rand(2, 3, 9, 32, 32, device="cuda")
+    z = torch.randn(2, 4, 11, 16, 16, device="cuda")
+    decode_batches = []
+    eager_decode = vae.decode
+
+    def recording_decode(latent):
+        decode_batches.append(int(latent.shape[0]))
+        return eager_decode(latent)
+
+    def run(cap):
+        state.encoder_tile_batch = state.decoder_tile_batch = state.window_batch = cap
+        decode_batches.clear()
+        with (
+            torch.autocast("cuda", dtype=torch.float16),
+            use_vae_fast_path(vae, True),
+            patch.object(vae, "decode", recording_decode),
+            patch.object(MiniMaxH3VaeFastPath, "admit", lambda self, supported: False),
+        ):
+            latent = vae.encode_temporal(x)
+            frames = vae.decode_temporal(z)
+            pixels = vae.processor.revert_tensor(frames)
+        return latent.clone(), frames.clone(), pixels.clone(), list(decode_batches)
+
+    ref_latent, ref_frames, ref_pixels, ref_batches = run(1)
+    assert set(ref_batches) == {1}
+    latent, frames, pixels, batches = run(capacity)
+    # Two windows x nine tiles x two samples = 36 single-sample decodes to batch.
+    assert max(batches) == capacity and sum(batches) == sum(ref_batches) == 36
+    assert latent.dtype == torch.float16 and frames.dtype == torch.float32
+    torch.testing.assert_close(latent, ref_latent, atol=1e-3, rtol=1e-3)
+    torch.testing.assert_close(frames, ref_frames, atol=1e-3, rtol=1e-3)
+    torch.testing.assert_close(pixels, ref_pixels, atol=1e-3, rtol=1e-3)
+
+
+@requires_h3_kernels
+@torch.no_grad()
+@pytest.mark.parametrize("ndim", [5, 4])
+def test_minimax_h3_revert_tensor_fast_path_is_bit_exact(ndim):
+    """``VAEProcessor.revert_tensor`` with the gate on runs the denorm kernel once
+    and is bitwise equal to the eager Normalize + clamp chain, for a clip and for
+    a single frame given as 4-D."""
+    vae = _h3_tiny_vae().cuda()
+    state = _h3_install(vae)
+    shape = (2, 3, 5, 8, 12) if ndim == 5 else (2, 3, 8, 12)
+    decoded = torch.randn(shape, device="cuda") * 0.6
+    with use_vae_fast_path(vae, False):
+        eager = vae.processor.revert_tensor(decoded)
+    with (
+        use_vae_fast_path(vae, True),
+        patch.object(
+            h3_processor,
+            "minimax_h3_vae_denorm_clamp",
+            wraps=h3_processor.minimax_h3_vae_denorm_clamp,
+        ) as fused,
+    ):
+        fast = vae.processor.revert_tensor(decoded)
+    assert fused.call_count == 1 and state.used == 1 and state.fallback == 0
+    assert fast.shape == eager.shape == (2, 3, shape[2] if ndim == 5 else 1, 8, 12)
+    assert fast.is_contiguous()
+    assert torch.equal(fast, eager)
+    assert fast.min().item() >= 0.0 and fast.max().item() <= 1.0
 
 
 if __name__ == "__main__":

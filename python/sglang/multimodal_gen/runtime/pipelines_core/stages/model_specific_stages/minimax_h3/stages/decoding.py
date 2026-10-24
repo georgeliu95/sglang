@@ -16,6 +16,9 @@ from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_c
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
 )
+from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.fast_path import (
+    minimax_h3_vae_fast_path_scope,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     StageParallelismType,
@@ -390,10 +393,17 @@ class MiniMaxH3DecodingStage(DecodingStage):
             )
             if visual_autocast_enabled:
                 selected_video_vae.prepare_decoder_autocast_weights(video_vae_dtype)
-            with autocast_context(
-                video_vae_dtype,
-                server_args.disable_autocast,
-                enabled=visual_autocast_enabled,
+            with (
+                autocast_context(
+                    video_vae_dtype,
+                    server_args.disable_autocast,
+                    enabled=visual_autocast_enabled,
+                ),
+                minimax_h3_vae_fast_path_scope(
+                    selected_video_vae,
+                    quality=batch.sampling_params.quality,
+                    stage="decode",
+                ),
             ):
                 video_decode = self._get_vae_decode_fn(
                     selected_video_vae,

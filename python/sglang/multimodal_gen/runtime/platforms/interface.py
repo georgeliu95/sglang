@@ -13,7 +13,6 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 
 import numpy as np
 import torch
-
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 if TYPE_CHECKING:
@@ -49,6 +48,8 @@ class AttentionBackendEnum(enum.Enum):
     RAIN_FUSION_ATTN = enum.auto()
     SOL_ATTN = enum.auto()
     SUBBLOCK_SPARSE_ATTN = enum.auto()
+    SUBBLOCK_SPARSE_ATTN_SM120_SAGE = enum.auto()
+    SUBBLOCK_SPARSE_ATTN_SM120_SAGE_A2A = enum.auto()
     CUBE_SPARSE_ATTN = enum.auto()
     NO_ATTENTION = enum.auto()
 
@@ -72,6 +73,8 @@ class AttentionBackendEnum(enum.Enum):
             AttentionBackendEnum.RAIN_FUSION_ATTN,
             AttentionBackendEnum.SOL_ATTN,
             AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN,
+            AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN_SM120_SAGE,
+            AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN_SM120_SAGE_A2A,
             AttentionBackendEnum.CUBE_SPARSE_ATTN,
         }
 

@@ -1,19 +1,49 @@
 # SPDX-License-Identifier: Apache-2.0
 # 3D causal CNN encoder for the MiniMax H3 visual VAE (inference-only bundle).
+from __future__ import annotations
+
 import os
+from typing import TYPE_CHECKING
 
 import torch.nn as nn
 import torch.nn.functional as F
 
+from sglang.kernels.ops.diffusion import (
+    can_use_group_norm_silu_ncthw,
+    group_norm_silu_ncthw,
+)
+
 from .conv import BaseConv3d
-from .norm import get_group_norm_3d, get_spatial_norm_3d
+from .norm import TemporalIsolatedGroupNorm, get_group_norm_3d, get_spatial_norm_3d
+
+if TYPE_CHECKING:
+    from .fast_path import MiniMaxH3VaeFastPath
 
 # ============================================================================
 # 3D CNN Components
 # ============================================================================
 
 
-def norm_silu(x, norm, cond=None):
+def norm_silu(x, norm, cond=None, *, fast_path: MiniMaxH3VaeFastPath | None = None):
+    if (
+        cond is None
+        and fast_path is not None
+        and isinstance(norm, nn.GroupNorm)
+        and fast_path.active(x)
+        and fast_path.admit(
+            can_use_group_norm_silu_ncthw(
+                x, norm.weight, norm.bias, num_groups=norm.num_groups, eps=norm.eps
+            )
+        )
+    ):
+        return group_norm_silu_ncthw(
+            x,
+            norm.weight,
+            norm.bias,
+            num_groups=norm.num_groups,
+            eps=norm.eps,
+            time_isolated=isinstance(norm, TemporalIsolatedGroupNorm),
+        )
     if cond is None:
         return F.silu(norm(x), inplace=True)
     else:
@@ -73,6 +103,8 @@ class ResnetBlock3D(nn.Module):
         self.in_channels = in_channels
         out_channels = in_channels if out_channels is None else out_channels
         self.out_channels = out_channels
+        # Filled by minimax_h3_vae_cuda_opt at load; None keeps the eager norm+SiLU.
+        self.fast_path: MiniMaxH3VaeFastPath | None = None
 
         self.use_fused_norm = (
             os.environ.get("MINIMAX_H3_USE_FUSED_NORM", "false").lower() == "true"
@@ -139,14 +171,14 @@ class ResnetBlock3D(nn.Module):
         if self.use_fused_norm:
             h = self.norm1(h, zq)
         else:
-            h = norm_silu(h, self.norm1, zq)
+            h = norm_silu(h, self.norm1, zq, fast_path=self.fast_path)
 
         h = self.conv1(h)
 
         if self.use_fused_norm:
             h = self.norm2(h, zq)
         else:
-            h = norm_silu(h, self.norm2, zq)
+            h = norm_silu(h, self.norm2, zq, fast_path=self.fast_path)
 
         h = self.conv2(h)
 
@@ -185,6 +217,8 @@ class EncoderFCN3D(nn.Module):
         self.space_down_factors = space_down
         self.time_down_factors = time_down
         self.in_channels = in_channels
+        # Filled by minimax_h3_vae_cuda_opt at load; None keeps the eager norm+SiLU.
+        self.fast_path: MiniMaxH3VaeFastPath | None = None
 
         self.use_fused_norm = (
             os.environ.get("MINIMAX_H3_USE_FUSED_NORM", "false").lower() == "true"
@@ -270,7 +304,7 @@ class EncoderFCN3D(nn.Module):
         if self.use_fused_norm:
             h = self.norm_out(h, zq)
         else:
-            h = norm_silu(h, self.norm_out, zq)
+            h = norm_silu(h, self.norm_out, zq, fast_path=self.fast_path)
 
         h = self.conv_out(h)
         return h
