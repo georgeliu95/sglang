@@ -137,6 +137,8 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
         """Fail closed unless the resident server matches the deployment
         audited for quality="high"."""
 
+        import os
+
         attention_backend = self._server_arg_value(server_args.attention_backend)
         attention_backend = (
             str(attention_backend).strip().lower()
@@ -213,6 +215,12 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
         # Experimental SM120 performance profile. It deliberately preserves the
         # original H200 quality audit and the fixed request-shape checks.
         sm120_profile = capability_int == 120 and server_args.num_gpus == 8
+        gb10_delivery_profile = (
+            os.environ.get("SGLANG_H3_GB10_DELIVERY") == "1"
+            and current_platform.is_cuda()
+            and capability_int == 121
+            and "GB10" in device_name.upper()
+        )
         if sm120_profile:
             sage = actual["component_attention_backends"].get("transformer")
             allowed = {
@@ -232,6 +240,17 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
                     "video_vae": "torch_cudnn_sdpa",
                 },
             )
+        if gb10_delivery_profile:
+            expected.update(
+                num_gpus={1, 2, 4},
+                sp_degree=server_args.num_gpus,
+                ulysses_degree=server_args.num_gpus,
+                quantization="fp8",
+                component_attention_backends={
+                    "transformer": "subblock_sparse_attn_sm120_sage_a2a",
+                    "video_vae": "torch_cudnn_sdpa",
+                },
+            )
         mismatches = {
             name: {"expected": wanted, "actual": actual[name]}
             for name, wanted in expected.items()
@@ -243,6 +262,7 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
         }
         if not current_platform.is_cuda() or (
             not sm120_profile
+            and not gb10_delivery_profile
             and ("H200" not in device_name.upper() or capability_int != 90)
         ):
             mismatches["device"] = {
@@ -254,7 +274,8 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
         if mismatches:
             raise ValueError(
                 'MiniMax-H3 quality="high" requires the strict 4xH200 audited '
-                f"or 8xSM120 experimental performance deployment; mismatches: {mismatches}"
+                "or 8xSM120 experimental performance deployment, or the explicit "
+                f"1/2/4xGB10 delivery profile; mismatches: {mismatches}"
             )
 
         if sm120_profile:
