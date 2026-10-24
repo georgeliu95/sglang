@@ -1147,6 +1147,9 @@ class Envs:
     SGLANG_INT4_WEIGHT = EnvBool(False)
     SGLANG_CPU_QUANTIZATION = EnvBool(False)
     SGLANG_FORCE_FP8_MARLIN = EnvBool(False)
+    # GB10 (SM121): run fp8_scaled_mm for the MiniMax-H3 DiT projections on the
+    # fused-scale CuTe DSL kernel; bit-identical to the AOT path.
+    SGLANG_ENABLE_GB10_CUTE_FP8_GEMM = EnvBool(False)
     # Cache BF16 expansions of Hopper group32 FP8 weights for larger GEMMs.
     # Disable to save the additional weight memory or allow online updates.
     SGLANG_OPT_HOPPER_BLOCK_FP8_BF16 = EnvBool(True)

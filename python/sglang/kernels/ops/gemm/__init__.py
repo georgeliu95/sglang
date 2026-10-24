@@ -22,6 +22,7 @@ if TYPE_CHECKING:
 
 _SM90 = frozenset({CapabilityRequirement.cuda(min_sm=(9, 0), max_sm=(9, 0))})
 _SM120 = frozenset({CapabilityRequirement.cuda(min_sm=(12, 0), max_sm=(12, 0))})
+_SM121 = frozenset({CapabilityRequirement.cuda(min_sm=(12, 1), max_sm=(12, 1))})
 _SM12X = frozenset({CapabilityRequirement.cuda(min_sm=(12, 0), max_sm=(12, 9))})
 _SM10X = frozenset({CapabilityRequirement.cuda(min_sm=(10, 0), max_sm=(10, 9))})
 _KDA_PACKAGE = "sglang.kernels.kda_kernels"
@@ -79,8 +80,8 @@ class Fp8ScaledMMOp(BaseFusedOp):
     """FP8 GEMM with independent per-row A and per-column B scales."""
 
     op = "gemm.fp8_scaled_mm"
-    priority = (KernelBackend.AOT, KernelBackend.TORCH)
-    capabilities = {KernelBackend.AOT: CUDA_ONLY}
+    priority = (KernelBackend.CUTE_DSL, KernelBackend.AOT, KernelBackend.TORCH)
+    capabilities = {KernelBackend.CUTE_DSL: _SM121, KernelBackend.AOT: CUDA_ONLY}
 
     def backend_eligible(
         self,
@@ -92,6 +93,12 @@ class Fp8ScaledMMOp(BaseFusedOp):
         out_dtype: torch.dtype,
         bias: Optional[torch.Tensor] = None,
     ) -> bool:
+        if backend is KernelBackend.CUTE_DSL:
+            from sglang.kernels.ops.gemm.gb10_cute_fp8 import eligible
+
+            return super().backend_eligible(
+                backend, mat_a, mat_b, scales_a, scales_b, out_dtype, bias
+            ) and eligible(mat_a, mat_b, scales_a, scales_b, out_dtype, bias)
         # The torch path is a measured SM90 win for some shapes, not a
         # capability limit; elsewhere the AOT kernel always runs.
         if (
@@ -144,6 +151,19 @@ class Fp8ScaledMMOp(BaseFusedOp):
         return sgl_kernel.fp8_scaled_mm(
             mat_a, mat_b, scales_a, scales_b, out_dtype, bias
         )
+
+    def forward_cute_dsl(
+        self,
+        mat_a: torch.Tensor,
+        mat_b: torch.Tensor,
+        scales_a: torch.Tensor,
+        scales_b: torch.Tensor,
+        out_dtype: torch.dtype,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        from sglang.kernels.ops.gemm.gb10_cute_fp8 import fp8_cute_mm
+
+        return fp8_cute_mm(mat_a, mat_b, scales_a, scales_b)
 
 
 _FP8_SCALED_MM = register_fused_op(Fp8ScaledMMOp(), __name__, "_FP8_SCALED_MM")
