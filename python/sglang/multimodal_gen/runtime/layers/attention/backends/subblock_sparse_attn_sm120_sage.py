@@ -23,6 +23,15 @@ class SubBlockSparseSageAttentionSM120Backend(SubBlockSparseAttentionBackend):
 
 
 class SubBlockSparseSageAttentionSM120Impl(SubBlockSparseAttentionImpl):
+    def _sparse_ready(self, q: torch.Tensor, k: torch.Tensor) -> bool:
+        """Select CAKE compute; its schedule controls dense versus sparse blocks."""
+        return (
+            self.layer_enabled
+            and q.dtype == torch.bfloat16
+            and k.shape[-3] >= self.schedule.min_seq_len
+            and not self.causal
+        )
+
     def _sparse_attention(self, q, k, v, sparse_query_block_mask=None):
         from .subblock_sparse_attn_sm120_sage_a2a import _SparseSageA2ACompute
 
