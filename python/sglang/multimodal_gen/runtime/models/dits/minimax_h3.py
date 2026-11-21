@@ -831,6 +831,33 @@ def _minimax_h3_attention_core_impl(
 
     _minimax_h3_bind_attention_backend(attention, q.dtype)
 
+    if (
+        os.environ.get("SGLANG_H3_RDMA_OVERLAP") == "1"
+        and q.dtype == torch.bfloat16
+        and ulysses_active
+        and not ring_active
+        and attention._attention_backend_enum
+        is AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN_SM120_SAGE_A2A
+    ):
+        from sglang.multimodal_gen.runtime.layers.attention.backends.sage_ulysses_route import (
+            check_v2g_route,
+        )
+
+        admission = check_v2g_route(
+            q, k, v, cu_seqlens_host=cu_seqlens_host, max_seqlen=max_seqlen,
+            ulysses_active=ulysses_active, ring_active=ring_active,
+        )
+        if admission.enabled:
+            from ulysses_head_pipeline.hq_sage.runtime import forward as rdma_forward
+            from ulysses_head_pipeline.hq_sage.payload import live_prefix
+
+            return rdma_forward(
+                q, k, v, used=live_prefix(cu_seqlens_host, max_seqlen),
+                softmax_scale=attention.softmax_scale,
+                mask=subblock_sparse_query_block_mask,
+                layer_enabled=attention._attention_impl.layer_enabled,
+            )
+
     if ulysses_active and not ring_active and gate_compress is None:
         out = _minimax_h3_pipelined_dense_attention(
             attention,
