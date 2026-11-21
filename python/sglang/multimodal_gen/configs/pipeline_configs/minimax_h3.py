@@ -170,6 +170,8 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
                 server_args.is_dit_layerwise_offload_selected
             ),
             "lora_path": server_args.lora_path,
+            "minimax_h3_ulysses_strict": server_args.minimax_h3_ulysses_strict,
+            "minimax_h3_ulysses_transport": server_args.minimax_h3_ulysses_transport,
             "model_variant": model_variant,
             "num_gpus": server_args.num_gpus,
             "performance_mode": server_args.performance_mode,
@@ -243,7 +245,7 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
             )
         if gb10_delivery_profile:
             expected.update(
-                num_gpus={1, 2, 4},
+                num_gpus={1, 2, 4, 8},
                 sp_degree=server_args.num_gpus,
                 ulysses_degree=server_args.num_gpus,
                 quantization="fp8",
@@ -252,6 +254,13 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
                     "video_vae": "torch_cudnn_sdpa",
                 },
             )
+            if server_args.num_gpus == 8:
+                # Only the strict route raises when the prepared Sage QKV exchange
+                # declines, instead of running the standalone Sage SSA unnoticed.
+                expected.update(
+                    minimax_h3_ulysses_strict=True,
+                    minimax_h3_ulysses_transport="nccl",
+                )
         mismatches = {
             name: {"expected": wanted, "actual": actual[name]}
             for name, wanted in expected.items()
@@ -276,7 +285,7 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
             raise ValueError(
                 'MiniMax-H3 quality="high" requires the strict 4xH200 audited '
                 "or 8xSM120 experimental performance deployment, or the explicit "
-                f"1/2/4xGB10 delivery profile; mismatches: {mismatches}"
+                f"1/2/4/8xGB10 delivery profile; mismatches: {mismatches}"
             )
 
         if sm120_profile:

@@ -57,7 +57,8 @@ def check_v2g_route(
     if q.dtype not in (torch.bfloat16, torch.float16) or q.shape[-1] != 128:
         return result("unsupported dtype/head dimension")
     world = get_ulysses_parallel_world_size()
-    if world not in ((2, 4) if gb10_delivery else (4, 8)) or q.shape[1] % world:
+    # FlashInfer's Sage2 prepare_qkv accepts only 2/4/8 ranks and fails collectively.
+    if world not in ((2, 4, 8) if gb10_delivery else (4, 8)) or q.shape[1] % world:
         return result("unsupported Ulysses geometry")
     total = q.shape[0] * world
     cu = cu_seqlens_host

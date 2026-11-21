@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -501,6 +502,8 @@ def _quality_server_args():
         is_dit_layerwise_offload_selected=False,
         lora_path=None,
         minimax_h3_adaln_online=False,
+        minimax_h3_ulysses_strict=False,
+        minimax_h3_ulysses_transport="nccl",
         performance_mode="speed",
         quantization=None,
         transformer_weights_path=None,
@@ -511,6 +514,74 @@ def _quality_server_args():
         ulysses_degree=4,
         use_fsdp_inference=False,
     )
+
+
+class _GB10Capability:
+    def to_int(self) -> int:
+        return 121
+
+
+@contextmanager
+def _gb10_delivery_platform():
+    with (
+        patch.dict(os.environ, {"SGLANG_H3_GB10_DELIVERY": "1"}),
+        patch.object(current_platform, "is_cuda", return_value=True),
+        patch.object(current_platform, "get_device_name", return_value="NVIDIA GB10"),
+        patch.object(
+            current_platform, "get_device_capability", return_value=_GB10Capability()
+        ),
+    ):
+        yield
+
+
+def _gb10_quality_server_args(num_gpus: int):
+    """The high-quality-sa-opt deployment as the 1/2/4-Spark campaign declared it."""
+    server_args = _quality_server_args()
+    server_args.num_gpus = server_args.sp_degree = num_gpus
+    server_args.ulysses_degree = num_gpus
+    server_args.quantization = "fp8"
+    server_args.component_attention_backends = {
+        "transformer": "subblock_sparse_attn_sm120_sage_a2a",
+        "video_vae": "torch_cudnn_sdpa",
+    }
+    server_args.minimax_h3_ulysses_strict = True
+    return server_args
+
+
+@pytest.mark.parametrize(
+    ("num_gpus", "strict"), [(1, False), (2, False), (4, False), (8, True)]
+)
+def test_gb10_quality_profile_admits_one_to_eight_sparks(num_gpus, strict):
+    config = MiniMaxH3PipelineConfig()
+    server_args = _gb10_quality_server_args(num_gpus)
+    server_args.minimax_h3_ulysses_strict = strict
+
+    with _gb10_delivery_platform():
+        config.validate_quality_deployment(server_args)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "mismatch"),
+    [
+        ({"num_gpus": 16, "sp_degree": 16, "ulysses_degree": 16}, "num_gpus"),
+        ({"minimax_h3_ulysses_strict": False}, "minimax_h3_ulysses_strict"),
+        (
+            {"minimax_h3_ulysses_transport": "flashinfer-pcie"},
+            "minimax_h3_ulysses_transport",
+        ),
+    ],
+)
+def test_gb10_eight_spark_quality_profile_fails_closed(overrides, mismatch):
+    """Eight Sparks have no 1/2/4-style audit, so only the strict NCCL route is
+    admitted: there a declined prepared-Sage exchange raises instead of silently
+    running the standalone Sage SSA behind a BF16 exchange."""
+    config = MiniMaxH3PipelineConfig()
+    server_args = _gb10_quality_server_args(8)
+    for field, value in overrides.items():
+        setattr(server_args, field, value)
+
+    with _gb10_delivery_platform(), pytest.raises(ValueError, match=mismatch):
+        config.validate_quality_deployment(server_args)
 
 
 def test_high_quality_deployment_rejects_transformer_weight_override():

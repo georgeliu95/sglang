@@ -4,9 +4,20 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+
+from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
+    MINIMAX_H3_PACKED_SEQUENCE_ALIGNMENT,
+)
+from sglang.multimodal_gen.runtime.layers.attention.backends import (
+    sage_ulysses_route as routing,
+)
 from sglang.multimodal_gen.runtime.layers.attention.backends import (
     subblock_sparse_attn_sm120_sage_a2a as adapter,
 )
+
+# Live packed rows of the 768p brass-band request, as the 4-Spark run logged them.
+_H3_768P_USED = 37765
+_H3_HEADS = 56
 
 
 @pytest.mark.parametrize("used", [64, 130])
@@ -173,3 +184,101 @@ def test_forward_reuses_flashinfer_prequantized_operands(monkeypatch, eligible):
         assert result.shape == (256, 2, 128) and torch.all(result == 5)
     else:
         assert calls == [] and result is None
+
+
+@pytest.fixture
+def h3_768p_route(monkeypatch):
+    """Run check_v2g_route on one rank's 768p H3 shard; CUDA and the group are faked."""
+    monkeypatch.delenv("SGLANG_DIFFUSION_DISABLE_SM120_LOWP_A2A_V2G", raising=False)
+    monkeypatch.setattr(
+        routing.torch.cuda, "is_current_stream_capturing", lambda: False
+    )
+    monkeypatch.setattr(routing.dist, "get_world_size", lambda group: group.size)
+
+    def route(
+        *,
+        world,
+        capability=(12, 1),
+        gb10_delivery=True,
+        heads=_H3_HEADS,
+        group_world=None,
+    ):
+        if gb10_delivery:
+            monkeypatch.setenv("SGLANG_H3_GB10_DELIVERY", "1")
+        else:
+            monkeypatch.delenv("SGLANG_H3_GB10_DELIVERY", raising=False)
+        monkeypatch.setattr(
+            routing.torch.cuda, "get_device_capability", lambda device: capability
+        )
+        monkeypatch.setattr(routing, "get_ulysses_parallel_world_size", lambda: world)
+        group = SimpleNamespace(size=world if group_world is None else group_world)
+        monkeypatch.setattr(
+            routing, "get_sp_group", lambda: SimpleNamespace(ulysses_group=group)
+        )
+        alignment = MINIMAX_H3_PACKED_SEQUENCE_ALIGNMENT
+        padded = -(-_H3_768P_USED // alignment) * alignment
+        assert padded % world == 0, "the packed H3 sequence must split evenly"
+        shard = SimpleNamespace(
+            ndim=3,
+            shape=(padded // world, heads, 128),
+            dtype=torch.bfloat16,
+            device="cuda:0",
+            is_cuda=True,
+            requires_grad=False,
+        )
+        with torch.no_grad():
+            return routing.check_v2g_route(
+                shard,
+                shard,
+                shard,
+                cu_seqlens_host=(0, _H3_768P_USED, padded),
+                max_seqlen=_H3_768P_USED,
+                ulysses_active=True,
+                ring_active=False,
+            )
+
+    return route
+
+
+@pytest.mark.parametrize("world", [2, 4, 8])
+def test_gb10_route_admits_h3_768p_shards_up_to_eight_sparks(h3_768p_route, world):
+    decision = h3_768p_route(world=world)
+
+    assert decision.enabled, decision.reason
+
+
+@pytest.mark.parametrize(("world", "heads"), [(3, 48), (6, 48), (16, 48), (8, 60)])
+def test_gb10_route_declines_geometries_flashinfer_sage2_rejects(
+    h3_768p_route, world, heads
+):
+    """FlashInfer's Sage2 prepare_qkv takes only 2/4/8 ranks with heads % world == 0
+    and fails collectively; the route has to decline before the exchange instead."""
+    decision = h3_768p_route(world=world, heads=heads)
+
+    assert decision.reason == "unsupported Ulysses geometry"
+
+
+@pytest.mark.parametrize(
+    ("capability", "gb10_delivery", "world", "enabled"),
+    [
+        ((12, 1), False, 8, False),
+        ((12, 0), True, 2, False),
+        ((12, 0), False, 8, True),
+    ],
+)
+def test_gb10_world_list_needs_both_the_delivery_switch_and_sm121(
+    h3_768p_route, capability, gb10_delivery, world, enabled
+):
+    decision = h3_768p_route(
+        world=world, capability=capability, gb10_delivery=gb10_delivery
+    )
+
+    assert decision.enabled is enabled, decision.reason
+
+
+def test_eight_rank_route_declines_a_ulysses_group_of_another_size(h3_768p_route):
+    """The NCCL Sage transport derives its rank count from the Ulysses group; a group
+    that disagrees with the Ulysses world would scatter the wrong head shards."""
+    decision = h3_768p_route(world=8, group_world=4)
+
+    assert decision.reason == "process group mismatch"
