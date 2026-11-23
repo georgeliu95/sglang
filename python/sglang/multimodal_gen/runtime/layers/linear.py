@@ -130,6 +130,12 @@ class LinearMethodBase(QuantizeMethodBase):
         block scales)`` tuple for this layer."""
         return False
 
+    def accepts_token_fp8_input(self, layer: torch.nn.Module) -> bool:
+        """Whether ``apply`` takes a prequantized ``(e4m3 rows [M, K], fp32
+        per-row scales [M, 1])`` tuple for this layer: the dynamic per-token
+        activation quantization it would otherwise run itself."""
+        return False
+
     @abstractmethod
     def create_weights(
         self,

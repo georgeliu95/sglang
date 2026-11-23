@@ -426,6 +426,49 @@ def _accepts_mxfp8_input(linear: nn.Module) -> bool:
     )
 
 
+# SGLANG_H3_TOKEN_FP8_FUSION=1: the producers of the dynamic per-token FP8 linears' inputs (fused norm + AdaLN for
+# qkv and fc1, rounded SwiGLU for fc2) emit (e4m3 rows, fp32 row scales) themselves, byte-identical to the separate
+# per-token quantizer they replace (kernels/ops/quantization/token_fp8_fused.py, test_token_fp8_fusion.py).
+_TOKEN_FP8_FUSION = os.environ.get("SGLANG_H3_TOKEN_FP8_FUSION", "0") == "1"
+
+
+def _accepts_token_fp8_input(linear: nn.Module) -> bool:
+    return (
+        _TOKEN_FP8_FUSION
+        and isinstance(linear, LinearBase)
+        and linear.quant_method is not None
+        and getattr(linear, "tp_size", 1) == 1
+        and linear.quant_method.accepts_token_fp8_input(linear)
+    )
+
+
+def _modulate_rmsnorm_token_fp8(
+    x: torch.Tensor,
+    norm: nn.Module,
+    shift: torch.Tensor,
+    scale: torch.Tensor,
+    indices: torch.Tensor,
+    *,
+    keep_bf16: bool,
+) -> tuple[torch.Tensor | None, tuple[torch.Tensor, torch.Tensor]] | None:
+    """The fused (one-rounding) RMSNorm + indexed AdaLN of _modulate_rmsnorm_scale_shift, quantized per token in the
+    same pass: (bf16 rows or None, (e4m3 rows, fp32 row scales)); None where that fused kernel would not run."""
+    from sglang.kernels.ops.quantization.token_fp8_fused import (
+        can_use_rmsnorm_indexed_scale_shift_fp8,
+        rmsnorm_indexed_scale_shift_fp8,
+    )
+
+    if (
+        x.dtype != _BF16_DTYPE
+        or norm.weight is None
+        or not can_use_rmsnorm_indexed_scale_shift_fp8(x, norm.weight, shift, scale, indices)
+    ):
+        return None
+    eps = norm.eps if norm.eps is not None else torch.finfo(x.dtype).eps
+    y, q, s = rmsnorm_indexed_scale_shift_fp8(x, norm.weight, shift, scale, indices, eps, keep_bf16=keep_bf16)
+    return y, (q, s)
+
+
 def _modulate_scale_shift(
     x: torch.Tensor,
     shift: torch.Tensor,
@@ -1638,6 +1681,20 @@ class MiniMaxH3MLP(nn.Module):
         if _accepts_mxfp8_input(self.fc2) and can_use_silu_mul_mxfp8(hidden):
             out, _ = self.fc2(silu_mul_mxfp8(hidden))
             return out
+        if (
+            not self.reuse_fc1_activation
+            and _accepts_token_fp8_input(self.fc2)
+            and hidden.shape[-1] % 16 == 0
+        ):
+            from sglang.kernels.ops.quantization.token_fp8_fused import (
+                can_use_silu_mul_fp8,
+                silu_mul_fp8,
+            )
+
+            if can_use_silu_mul_fp8(hidden):
+                # The rounded SwiGLU (_silu_mul's CUDA path) quantized per token in the same pass.
+                out, _ = self.fc2(silu_mul_fp8(hidden))
+                return out
         hidden = _silu_mul(hidden, reuse_input=self.reuse_fc1_activation)
         out, _ = self.fc2(hidden)
         return out
@@ -1872,15 +1929,27 @@ class MiniMaxH3DiTBlock(nn.Module):
                     h, shift_msa, scale_msa, combined_indices, dtype=_BF16_DTYPE
                 )
         else:
-            h = _modulate_rmsnorm_scale_shift(
-                x,
-                self.norm1,
-                shift_msa,
-                scale_msa,
-                combined_indices,
-                dtype=_BF16_DTYPE,
-                fused=MINIMAX_H3_NORM_MODULATE.is_enabled(self),
+            fused_norm = MINIMAX_H3_NORM_MODULATE.is_enabled(self)
+            token = (
+                _modulate_rmsnorm_token_fp8(
+                    x, self.norm1, shift_msa, scale_msa, combined_indices, keep_bf16=True
+                )
+                if fused_norm and _accepts_token_fp8_input(self.attn.qkv_proj)
+                else None
             )
+            if token is not None:
+                # bf16 rows kept: the attention reads their shape/device and the hybrid branch reads them.
+                h, h_prequant = token
+            else:
+                h = _modulate_rmsnorm_scale_shift(
+                    x,
+                    self.norm1,
+                    shift_msa,
+                    scale_msa,
+                    combined_indices,
+                    dtype=_BF16_DTYPE,
+                    fused=fused_norm,
+                )
         h = self.attn(
             h,
             x_prequant=h_prequant,
@@ -1915,16 +1984,27 @@ class MiniMaxH3DiTBlock(nn.Module):
                 )
                 h = self.mlp(h)
         else:
-            h = _modulate_rmsnorm_scale_shift(
-                x,
-                self.norm2,
-                shift_mlp,
-                scale_mlp,
-                combined_indices,
-                dtype=_BF16_DTYPE,
-                fused=MINIMAX_H3_NORM_MODULATE.is_enabled(self),
+            fused_norm = MINIMAX_H3_NORM_MODULATE.is_enabled(self)
+            token = (
+                _modulate_rmsnorm_token_fp8(
+                    x, self.norm2, shift_mlp, scale_mlp, combined_indices, keep_bf16=False
+                )
+                if fused_norm and _accepts_token_fp8_input(self.mlp.fc1)
+                else None
             )
-            h = self.mlp(h)
+            if token is not None:
+                h = self.mlp(token[1])
+            else:
+                h = _modulate_rmsnorm_scale_shift(
+                    x,
+                    self.norm2,
+                    shift_mlp,
+                    scale_mlp,
+                    combined_indices,
+                    dtype=_BF16_DTYPE,
+                    fused=fused_norm,
+                )
+                h = self.mlp(h)
         # `residual` is block-local here (see above), so this stays in-place
         # even while Cache-DiT is attached.
         return _modulate_gate(

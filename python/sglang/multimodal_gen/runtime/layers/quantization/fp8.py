@@ -474,12 +474,39 @@ class Fp8LinearMethod(LinearMethodBase):
             # Activations not quantized for marlin.
             del layer.input_scale
 
+    def accepts_token_fp8_input(self, layer: torch.nn.Module) -> bool:
+        # Only the default branch of ``apply`` quantizes the activation per
+        # token itself (apply_fp8_linear's dynamic path, no static input scale).
+        return not (
+            getattr(self, "use_gfx1250_triton_fp8", False)
+            or self.per_channel_serialized
+            or self.use_marlin
+            or self.block_quant
+        ) and getattr(layer, "input_scale", None) is None
+
     def apply(
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if isinstance(x, tuple) and not self.block_quant:
+            # ``(e4m3 rows, fp32 per-row scales)`` from a producer-fused
+            # quantizer (token_fp8_fused.py): the bytes the dynamic per-token
+            # path below would have produced, so the GEMM sees the same inputs.
+            if not self.accepts_token_fp8_input(layer):
+                raise ValueError("this FP8 linear does not take pre-quantized per-token rows")
+            values, scales = x
+            return apply_fp8_linear(
+                input=values,
+                weight=layer.weight,
+                weight_scale=layer.weight_scale,
+                input_scale=scales,
+                bias=bias,
+                cutlass_fp8_supported=self.cutlass_fp8_supported,
+                use_per_token_if_dynamic=False,
+                pre_quant_output_dtype=torch.bfloat16,
+            )
         # The activation quantization kernels assert on row-major input, and
         # diffusion backbones routinely pass a permuted view. Normalising at the
         # producer instead would also move the unquantized path's output, by
