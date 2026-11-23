@@ -47,6 +47,7 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY: bool = False
     SGLANG_DIFFUSION_MINIMAX_H3_ADALN_GPU_PLANS: int = 64
     SGLANG_DIFFUSION_MINIMAX_H3_ADALN_FP32: bool = False
+    SGLANG_DIFFUSION_MINIMAX_H3_ADALN_HOST_CACHE_GB: float | None = None
     SGLANG_DIFFUSION_CONVROT_INT8_BACKEND: str = "auto"
     SGLANG_DIFFUSION_MINIMAX_H3_PDD_HEADS: str | None = None
     SGLANG_DIFFUSION_FLUX3_NATTEN_BACKEND: str | None = None
@@ -311,6 +312,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # adaln_proj weights; keep off until an e2e trajectory gate clears it.
     "SGLANG_DIFFUSION_MINIMAX_H3_ADALN_FP32": _lazy_bool(
         "SGLANG_DIFFUSION_MINIMAX_H3_ADALN_FP32"
+    ),
+    # --minimax-h3-adaln-host-cache-gb for harnesses that pass only environment
+    # variables (e.g. DiffusionLab); an explicitly set argument wins. The tier
+    # is pinned host memory allocated at load, read only when a plan set was
+    # evicted from the GPU slab (never with a single schedule).
+    "SGLANG_DIFFUSION_MINIMAX_H3_ADALN_HOST_CACHE_GB": _lazy_optional_float(
+        "SGLANG_DIFFUSION_MINIMAX_H3_ADALN_HOST_CACHE_GB"
     ),
     # Fraction of denoising steps that run both CFG branches before reusing the
     # last conditional-minus-unconditional residual. Keep 1.0 to disable.

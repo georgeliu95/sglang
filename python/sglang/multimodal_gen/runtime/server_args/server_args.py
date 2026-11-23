@@ -736,6 +736,11 @@ class ServerArgs(DisaggServerArgsMixin):
         self.pipeline_config.validate_server_args(self)
 
     def _validate_minimax_h3_adaln(self) -> None:
+        override = envs.SGLANG_DIFFUSION_MINIMAX_H3_ADALN_HOST_CACHE_GB
+        if override is not None and not self.is_arg_explicitly_set(
+            "minimax_h3_adaln_host_cache_gb"
+        ):
+            self.minimax_h3_adaln_host_cache_gb = override
         # Warn, not raise: config-file and from_kwargs construction mark every
         # provided key as explicit, so a shared base config pinning the
         # default (or 0) must not fail non-online launches.
