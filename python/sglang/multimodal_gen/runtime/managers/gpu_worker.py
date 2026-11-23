@@ -439,6 +439,13 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         os.environ["RANK"] = str(self.rank)
         os.environ["WORLD_SIZE"] = str(self.server_args.num_gpus)
         self._configure_persistent_torch_compile_cache()
+        # SGLANG_DIFFUSION_NCCL_ENV="NCCL_A=x;NCCL_B=y": NCCL settings for this worker, applied before NCCL initializes
+        # (harnesses that pass only SGLANG_* variables, e.g. DiffusionLab, can still set NCCL_DEBUG / buffer sizes).
+        # "{rank}" in a value becomes this worker's rank. Keys that do not start with NCCL_ are ignored.
+        for item in filter(None, os.environ.get("SGLANG_DIFFUSION_NCCL_ENV", "").split(";")):
+            key, _, value = item.partition("=")
+            if key.strip().startswith("NCCL_"):
+                os.environ[key.strip()] = value.replace("{rank}", str(self.rank))
         # SGLANG_DIFFUSION_EARLY_PINNED: clean memory first, then the long-lived pinned buffers (before NCCL and models)
         from sglang.multimodal_gen.runtime.managers.memory_managers import early_pinned
 
