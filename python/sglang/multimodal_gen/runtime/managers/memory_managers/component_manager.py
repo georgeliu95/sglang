@@ -234,6 +234,15 @@ class ComponentResidencyManager:
             # before stage 0 remains part of the placement constraints.
             self._warmup_phase_key = "request:before-stage"
         self._validate_explicit_nonresident_components()
+        if (
+            envs.SGLANG_DIFFUSION_DROP_RESIDENT_CHECKPOINT_CACHE
+            and not getattr(self, "_dropped_checkpoint_cache_after_load", False)
+            and current_platform.device_shares_host_memory()
+        ):
+            # The first request also starts on a pool full of the checkpoints just loaded onto the device; without
+            # this only requests after the first one (the drop at finish_request) get that memory back.
+            self._dropped_checkpoint_cache_after_load = True
+            self._drop_resident_checkpoint_cache()
 
     def _validate_explicit_nonresident_components(self) -> None:
         """Reject explicit offload selectors with no request-time use site.
@@ -665,6 +674,8 @@ class ComponentResidencyManager:
             # One pool: every byte the caching allocator keeps reserved between
             # requests is page cache the next request's streamed encoder cannot use.
             torch.get_device_module().empty_cache()
+            if envs.SGLANG_DIFFUSION_DROP_RESIDENT_CHECKPOINT_CACHE:
+                self._drop_resident_checkpoint_cache()
             if envs.SGLANG_DIFFUSION_DEBUG_HOST_MEMORY:
                 from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_breakdown import (
                     log_host_memory_breakdown,
@@ -672,10 +683,50 @@ class ComponentResidencyManager:
 
                 self._debug_requests_seen = getattr(self, "_debug_requests_seen", 0) + 1
                 log_host_memory_breakdown(
-                    self.placement_modules(),
+                    self.pipeline.modules,
                     label=f"after request {self._debug_requests_seen}",
                 )
         self._prefetch_next_request()
+
+    def _drop_resident_checkpoint_cache(self) -> None:
+        """posix_fadvise(DONTNEED) over the checkpoint files of every component resident on the device.
+
+        On a shared host/device pool the clean page cache of a checkpoint whose weights already sit on the device is
+        memory no request reads, kept at the expense of free memory (and of the kernel's reclaim / compaction work
+        when the pool is full). The kernel keeps pages that are still mapped, so a component that later maps its
+        checkpoint again only re-reads it. Layerwise-offloaded components stream from their checkpoint mapping every
+        request and are skipped.
+        """
+        import glob
+        import os
+
+        dropped = []
+        for name, module in self.pipeline.modules.items():
+            if not isinstance(module, nn.Module) or is_layerwise_offloaded_module(module):
+                continue
+            if not self._module_on_supported_device(module):
+                continue
+            path = self.server_args.model_paths.get(name)
+            if not path or not os.path.isdir(path):
+                continue
+            files = sorted(glob.glob(os.path.join(path, "*.safetensors")))
+            for file in files:
+                try:
+                    fd = os.open(file, os.O_RDONLY)
+                except OSError:
+                    continue
+                try:
+                    os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+                finally:
+                    os.close(fd)
+            if files:
+                dropped.append(f"{name} ({len(files)} files)")
+        if dropped and not getattr(self, "_logged_checkpoint_cache_drop", False):
+            self._logged_checkpoint_cache_drop = True
+            logger.info(
+                "dropping the page cache of resident checkpoints before the first request and after each request: %s",
+                ", ".join(dropped),
+            )
 
     def _prefetch_next_request(self) -> None:
         """H2D / restore uses that set prefetch_after_request."""

@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_DISABLE_MAPPED_WILLNEED: bool = False
     SGLANG_DIFFUSION_DISABLE_MAPPED_DIRECT_READ: bool = False
     SGLANG_DIFFUSION_DEBUG_HOST_MEMORY: bool = False
+    SGLANG_DIFFUSION_DROP_RESIDENT_CHECKPOINT_CACHE: bool = False
     SGLANG_DIFFUSION_DEBUG_LAYERWISE_TIMING: bool = False
     SGLANG_DIFFUSION_DISABLE_LORA_MERGE_CACHE: bool = False
     SGLANG_DIFFUSION_PLATFORM_OVERRIDE: str = ""
@@ -363,6 +364,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the kernel's view of the process.
     "SGLANG_DIFFUSION_DEBUG_HOST_MEMORY": _lazy_bool(
         "SGLANG_DIFFUSION_DEBUG_HOST_MEMORY"
+    ),
+    # Shared host/device pool: before the first request and after every
+    # request, advise the kernel to drop the page cache of the checkpoints of
+    # components resident on the device
+    # (their weights were copied at load; only a rebuilt AdaLN plan re-reads
+    # the DiT checkpoint). Layerwise-offloaded components, which stream from
+    # their checkpoint mapping every request, are never touched.
+    "SGLANG_DIFFUSION_DROP_RESIDENT_CHECKPOINT_CACHE": _lazy_bool(
+        "SGLANG_DIFFUSION_DROP_RESIDENT_CHECKPOINT_CACHE"
     ),
     # Debug: at the end of every layerwise stage, log where the courier and the
     # compute thread spent their time (populate, memcpy, H2D, waits).
