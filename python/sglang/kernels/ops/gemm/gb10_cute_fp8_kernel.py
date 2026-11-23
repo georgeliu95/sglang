@@ -140,7 +140,21 @@ class Sm120RowwiseGemmKernel:
         a_cache_evict_last: bool = False,
         b_cache_evict_first: bool = False,
         c_store_evict_first: bool = False,
+        head_scales: bool = False,
+        head_scale_rows: int = 1,
     ):
+        # A carries one FP32 scale per (head_scale_rows rows, 128 columns of K), e.g. per (512 tokens, attention
+        # head), given as head_scale[K / 128, ceil(M / head_scale_rows)]. The scale cannot leave the K sum, so the
+        # single accumulator is kept in units of the current K block's scale: entering K block h it is multiplied
+        # by head_scale[h - 1, blk] / head_scale[h, blk], and the staged epilogue row scale is head_scale[-1, blk].
+        # Row blocks span whole 256-row tiles, so one scale pair per tile (two registers) and no row guard.
+        self.head_scales = head_scales
+        self.head_scale_rows = head_scale_rows
+        if head_scales:
+            assert tuple(tile_shape_mnk) == (256, 192, 64) and mma_warps == 8, "Head scales assume tile256x192x64 and atom4x2"
+            assert not promote_each_tile and not write_raw and not native_mma, "Head scales use the plain FP32 accumulator"
+            assert stage_scales, "Head scales feed the epilogue through the staged row scales"
+            assert head_scale_rows % tile_shape_mnk[0] == 0 and head_scale_rows & (head_scale_rows - 1) == 0, "Row blocks: a power of two covering whole M tiles"
         # Tile order only: bands of swizzle_size M tiles (sweep N inside a band) instead of bands of N tiles.
         self.swizzle_along_m = swizzle_along_m
         # Issue epilogue job j+1's scale loads before job j's math and barriers (same values, same arithmetic).
@@ -381,6 +395,7 @@ class Sm120RowwiseGemmKernel:
         raw_output: cute.Tensor,
         scale_a: cute.Tensor,
         scale_b: cute.Tensor,
+        head_scale: cute.Tensor,
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
     ):
@@ -515,6 +530,7 @@ class Sm120RowwiseGemmKernel:
             raw_output,
             scale_a,
             scale_b,
+            head_scale,
             self.tiled_mma,
             self.cta_layout_mnk,
             self.a_smem_layout_staged,
@@ -543,6 +559,7 @@ class Sm120RowwiseGemmKernel:
         raw_output: cute.Tensor,
         scale_a: cute.Tensor,
         scale_b: cute.Tensor,
+        head_scale: cute.Tensor,
         tiled_mma: cute.TiledMma,
         cta_layout_mnk: cute.Layout,
         a_smem_layout_staged: cute.ComposedLayout,
@@ -800,6 +817,11 @@ class Sm120RowwiseGemmKernel:
 
             num_k_blocks = cute.size(tCrA, mode=[2])
 
+            if cutlass.const_expr(self.head_scales):
+                # [0]: scale of the K block being accumulated, [1]: the next one (prefetched a block ahead).
+                head_pair = cute.make_rmem_tensor((2,), cutlass.Float32)
+                head_count = k_tile_cnt // 2  # 128 columns of K per scale block, 64 per k tile
+
             # ///////////////////////////////////////////////////////////////////////////////
             # Copy Atom A/B retiling for TMA load A/B
             # ///////////////////////////////////////////////////////////////////////////////
@@ -849,6 +871,10 @@ class Sm120RowwiseGemmKernel:
                 accumulators.fill(0.0)
                 if cutlass.const_expr(self.promote_each_tile):
                     accum_sum.fill(0.0)
+                if cutlass.const_expr(self.head_scales):
+                    head_block = tile_coord_mnl[0] * self.tile_shape_mnk[0] // self.head_scale_rows
+                    head_pair[0] = head_scale[0, head_block]
+                    head_pair[1] = head_scale[1, head_block]
 
                 # /////////////////////////////////////////////////////////////////////////////
                 #  Pipelined MAINLOOP
@@ -892,6 +918,16 @@ class Sm120RowwiseGemmKernel:
                 )
 
                 for k_tile in range(0, k_tile_cnt - 1, 1, unroll=1):
+                    if cutlass.const_expr(self.head_scales):
+                        # Every MMA of the previous block is issued; rescale before this block's first MMA.
+                        if k_tile > 0:
+                            if k_tile % 2 == 0:
+                                head_ratio_now = head_pair[0] / head_pair[1]
+                                accumulators.store(accumulators.load() * head_ratio_now)
+                                head_pair[0] = head_pair[1]
+                                head_next = k_tile // 2 + 1
+                                if head_next < head_count:
+                                    head_pair[1] = head_scale[head_next, head_block]
                     # unroll the loop
                     for k_block_idx in cutlass.range_constexpr(num_k_blocks):
                         k_block_next = (
@@ -1381,12 +1417,21 @@ class Sm120RowwiseGemmKernel:
                                 scale_tile_coord, tile_sched_params.problem_shape_ntile_mnl
                             )
                         scale_pipeline.producer_acquire(scale_producer_state)
-                        for scale_j in cutlass.range_constexpr(self.tile_shape_mnk[0] // self.num_threads_per_warp):
-                            scale_row = scale_lane + self.num_threads_per_warp * scale_j
-                            scale_row_global = scale_tile_coord[0] * self.tile_shape_mnk[0] + scale_row
-                            sScale[scale_row] = cutlass.Float32(0.0)
-                            if scale_row_global < cute.size(scale_a):
-                                sScale[scale_row] = scale_a[scale_row_global]
+                        if cutlass.const_expr(self.head_scales):
+                            # The accumulator ends in units of the last K block's scale, shared by the whole tile.
+                            last_scale = head_scale[
+                                cute.size(head_scale, mode=[0]) - 1,
+                                scale_tile_coord[0] * self.tile_shape_mnk[0] // self.head_scale_rows,
+                            ]
+                            for scale_j in cutlass.range_constexpr(self.tile_shape_mnk[0] // self.num_threads_per_warp):
+                                sScale[scale_lane + self.num_threads_per_warp * scale_j] = last_scale
+                        else:
+                            for scale_j in cutlass.range_constexpr(self.tile_shape_mnk[0] // self.num_threads_per_warp):
+                                scale_row = scale_lane + self.num_threads_per_warp * scale_j
+                                scale_row_global = scale_tile_coord[0] * self.tile_shape_mnk[0] + scale_row
+                                sScale[scale_row] = cutlass.Float32(0.0)
+                                if scale_row_global < cute.size(scale_a):
+                                    sScale[scale_row] = scale_a[scale_row_global]
                         for scale_j in cutlass.range_constexpr(self.tile_shape_mnk[1] // self.num_threads_per_warp):
                             scale_col = scale_lane + self.num_threads_per_warp * scale_j
                             scale_col_global = scale_tile_coord[1] * self.tile_shape_mnk[1] + scale_col

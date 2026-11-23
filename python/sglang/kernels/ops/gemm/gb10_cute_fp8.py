@@ -37,7 +37,9 @@ _MIN_M: Final = 1024
 _COMPILED: Final[dict[tuple[int, int, int, int, _Variant], object]] = {}
 
 
-def _compile(a, b, c, raw, sa, sb, variant: _Variant, sm_count: int, stream) -> object:
+def _compile(
+    a, b, c, raw, sa, sb, ratio, variant: _Variant, sm_count: int, stream, head_scale_rows: int = 0
+) -> object:
     import cutlass
     import cutlass.cute as cute
 
@@ -52,8 +54,9 @@ def _compile(a, b, c, raw, sa, sb, variant: _Variant, sm_count: int, stream) -> 
         reuse_column_scales=False, specialize_output_state=True,
         swizzle_along_m=variant.along_m, prefetch_scales=False,
         stage_scales=variant.stage_scales,
+        head_scales=head_scale_rows > 0, head_scale_rows=max(head_scale_rows, 1),
     )  # fmt: skip
-    return cute.compile(kernel, a, b, c, raw, sa, sb, sm_count, stream)
+    return cute.compile(kernel, a, b, c, raw, sa, sb, ratio, sm_count, stream)
 
 
 def fp8_cute_mm(
@@ -72,7 +75,8 @@ def fp8_cute_mm(
     cute_c = from_dlpack(c.unsqueeze(-1), assumed_align=16)
     cute_sa = from_dlpack(sa.reshape(m), assumed_align=4)
     cute_sb = from_dlpack(sb.reshape(n), assumed_align=4)
-    # The kernel ABI carries an unused raw-accumulator operand (write_raw=False).
+    # The kernel ABI carries an unused raw-accumulator operand (write_raw=False) and,
+    # without head scales, an unused ratio operand; one placeholder serves both.
     raw = from_dlpack(torch.empty((1, 1), device=a.device), assumed_align=4)
     stream = cuda.CUstream(torch.cuda.current_stream(a.device).cuda_stream)
     key = (m, n, k, a.device.index or 0, variant)
@@ -80,9 +84,55 @@ def fp8_cute_mm(
     if compiled is None:
         sm_count = torch.cuda.get_device_properties(a.device).multi_processor_count
         compiled = _COMPILED[key] = _compile(
-            cute_a, cute_b, cute_c, raw, cute_sa, cute_sb, variant, sm_count, stream
+            cute_a, cute_b, cute_c, raw, cute_sa, cute_sb, raw, variant, sm_count, stream
         )
-    compiled(cute_a, cute_b, cute_c, raw, cute_sa, cute_sb, stream)
+    compiled(cute_a, cute_b, cute_c, raw, cute_sa, cute_sb, raw, stream)
+    return c
+
+
+HEAD_K: Final = 128  # columns of K per A scale block (one attention head)
+HEAD_ROWS: Final = 512  # rows (tokens) per A scale block
+
+
+def fp8_cute_mm_head_scaled(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    head_scale: torch.Tensor,
+    sb: torch.Tensor,
+    rows: int = HEAD_ROWS,
+) -> torch.Tensor:
+    """BF16(sum_h head_scale[h, r // rows] * FP32(a[r, h-th 128 columns] @ b[h-th 128 rows]) * sb).
+
+    a [M, K] E4M3 row-major with one FP32 scale per (rows rows, 128 columns of K):
+    head_scale [K / 128, ceil(M / rows)], contiguous, all > 0. b [K, N] E4M3 column-major
+    with a per-column scale. rows is a power of two >= 256 (whole 256-row tiles).
+    """
+    import cuda.bindings.driver as cuda
+    from cutlass.cute.runtime import from_dlpack
+
+    m, k = a.shape
+    n = b.shape[1]
+    if k % HEAD_K or head_scale.shape != (k // HEAD_K, -(-m // rows)) or not head_scale.is_contiguous():
+        raise ValueError("head_scale does not match a")
+    variant = _VARIANTS[(n, k)]
+    c = torch.empty((m, n), dtype=torch.bfloat16, device=a.device)
+    cute_a = from_dlpack(a.unsqueeze(-1), assumed_align=16)
+    cute_b = from_dlpack(b.T.unsqueeze(-1), assumed_align=16)
+    cute_c = from_dlpack(c.unsqueeze(-1), assumed_align=16)
+    cute_sb = from_dlpack(sb.reshape(n), assumed_align=4)
+    cute_hs = from_dlpack(head_scale, assumed_align=4)
+    # Unused here: the raw-accumulator operand and the row scales (the epilogue takes head_scale[-1]).
+    raw = from_dlpack(torch.empty((1, 1), device=a.device), assumed_align=4)
+    stream = cuda.CUstream(torch.cuda.current_stream(a.device).cuda_stream)
+    key = (m, n, k, a.device.index or 0, variant, "head", rows)
+    compiled = _COMPILED.get(key)
+    if compiled is None:
+        sm_count = torch.cuda.get_device_properties(a.device).multi_processor_count
+        compiled = _COMPILED[key] = _compile(
+            cute_a, cute_b, cute_c, raw, raw, cute_sb, cute_hs, variant, sm_count, stream,
+            head_scale_rows=rows,
+        )
+    compiled(cute_a, cute_b, cute_c, raw, raw, cute_sb, cute_hs, stream)
     return c
 
 

@@ -12,7 +12,7 @@ import math
 import os
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator
-from typing import Any
+from typing import Any, NamedTuple
 
 import torch
 from torch import nn
@@ -808,6 +808,13 @@ def _minimax_h3_qknorm_rope_pipelined_attention(
     )
 
 
+class HeadScaledOperand(NamedTuple):
+    """out_proj input as E4M3 [tokens, heads * 128] with head_scale [heads, ceil(tokens / 512)] FP32."""
+
+    data: torch.Tensor
+    head_scale: torch.Tensor
+
+
 def _minimax_h3_attention_core_impl(
     attention: MiniMaxH3Attention,
     q: torch.Tensor,
@@ -851,12 +858,20 @@ def _minimax_h3_attention_core_impl(
             from ulysses_head_pipeline.hq_sage.runtime import forward as rdma_forward
             from ulysses_head_pipeline.hq_sage.payload import live_prefix
 
-            return rdma_forward(
+            out = rdma_forward(
                 q, k, v, used=live_prefix(cu_seqlens_host, max_seqlen),
                 softmax_scale=attention.softmax_scale,
                 mask=subblock_sparse_query_block_mask,
                 layer_enabled=attention._attention_impl.layer_enabled,
             )
+            if isinstance(out, tuple):
+                # SGLANG_H3_RDMA_OUTPUT=e4m3h: the out_proj operand itself (E4M3 data and one FP32 scale per
+                # 512 tokens x head), encoded where each head was attended; MiniMaxH3Attention.forward runs
+                # the head-scaled GEMM. Valid until the next attention layer's exchange.
+                if os.environ.get("SGLANG_H3_RDMA_OUTPUT") != "e4m3h":
+                    raise ValueError("MiniMax-H3 consumes only the e4m3h Spark RDMA operand")
+                return HeadScaledOperand(*out)
+            return out
 
     if ulysses_active and not ring_active and gate_compress is None:
         out = _minimax_h3_pipelined_dense_attention(
@@ -1450,8 +1465,29 @@ class MiniMaxH3Attention(nn.Module):
             ulysses_active=ulysses_active,
             ring_active=ring_active,
         )
+        if isinstance(out, HeadScaledOperand):
+            return self._out_proj_head_scaled(out)
         out, _ = self.out_proj(out)
         return out
+
+    def _out_proj_head_scaled(self, operand: HeadScaledOperand) -> torch.Tensor:
+        """out_proj on the e4m3h operand: sglang's head-scaled CuTe GEMM with the layer's own per-channel E4M3
+        weight ([K, N], stride (1, K)) and weight scale; no activation quantization runs here."""
+        from sglang.kernels.ops.gemm.gb10_cute_fp8 import fp8_cute_mm_head_scaled
+
+        weight = self.out_proj.weight
+        weight_scale = getattr(self.out_proj, "weight_scale", None)
+        if (
+            weight.dtype != torch.float8_e4m3fn
+            or weight_scale is None
+            or weight_scale.numel() != weight.shape[1]
+            or self.out_proj.bias is not None
+            or self.out_proj.tp_size != 1
+        ):
+            raise ValueError("the e4m3h operand needs a per-channel FP8 out_proj without bias or tensor parallelism")
+        return fp8_cute_mm_head_scaled(
+            operand.data, weight, operand.head_scale, weight_scale.reshape(-1).float()
+        )
 
     def _attend(
         self,
@@ -1543,6 +1579,8 @@ class MiniMaxH3Attention(nn.Module):
             ring_active=ring_active,
             gate_compress=gate_compress,
         )
+        if isinstance(out, HeadScaledOperand):
+            return out
         return out.reshape(total, self.num_heads * self.head_dim)
 
     _attend_eager = torch.compiler.disable(_attend)
