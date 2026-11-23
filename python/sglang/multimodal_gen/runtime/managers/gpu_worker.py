@@ -439,6 +439,10 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         os.environ["RANK"] = str(self.rank)
         os.environ["WORLD_SIZE"] = str(self.server_args.num_gpus)
         self._configure_persistent_torch_compile_cache()
+        # SGLANG_DIFFUSION_EARLY_PINNED: clean memory first, then the long-lived pinned buffers (before NCCL and models)
+        from sglang.multimodal_gen.runtime.managers.memory_managers import early_pinned
+
+        early_pinned.prepare(self.server_args)
         # initialize the distributed environment
         maybe_init_distributed_environment_and_model_parallel(
             tp_size=self.server_args.tp_size,
@@ -450,6 +454,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             distributed_init_method=rendezvous_addr.to_tcp(),
             dist_timeout=self.server_args.dist_timeout,
         )
+        early_pinned.warm_up_process_groups()
 
         from sglang.srt.runtime_context import get_context, publish
         from sglang.srt.server_args import ServerArgs as SrtServerArgs

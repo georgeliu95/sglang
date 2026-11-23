@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_DISABLE_MAPPED_DIRECT_READ: bool = False
     SGLANG_DIFFUSION_DEBUG_HOST_MEMORY: bool = False
     SGLANG_DIFFUSION_DROP_RESIDENT_CHECKPOINT_CACHE: bool = False
+    SGLANG_DIFFUSION_EARLY_PINNED: bool = False
     SGLANG_DIFFUSION_DEBUG_LAYERWISE_TIMING: bool = False
     SGLANG_DIFFUSION_DISABLE_LORA_MERGE_CACHE: bool = False
     SGLANG_DIFFUSION_PLATFORM_OVERRIDE: str = ""
@@ -374,6 +375,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_DIFFUSION_DROP_RESIDENT_CHECKPOINT_CACHE": _lazy_bool(
         "SGLANG_DIFFUSION_DROP_RESIDENT_CHECKPOINT_CACHE"
     ),
+    # GB10 / shared host-device pool: at worker start, before the distributed environment and any model, drop this
+    # model's checkpoint page cache and reserve the long-lived pinned buffers (MiniMax-H3 AdaLN host tier), so their
+    # pinned pages land in clean memory instead of among page-cache pages, where kernel compaction keeps failing to
+    # migrate them and slows the whole GPU (memory_managers/early_pinned.py). SGLANG_DIFFUSION_EARLY_PINNED_NCCL=1
+    # also has NCCL connect every transport at communicator creation (off: that pinned 54 GiB per rank on 8 GB10).
+    "SGLANG_DIFFUSION_EARLY_PINNED": _lazy_bool("SGLANG_DIFFUSION_EARLY_PINNED"),
     # Debug: at the end of every layerwise stage, log where the courier and the
     # compute thread spent their time (populate, memcpy, H2D, waits).
     "SGLANG_DIFFUSION_DEBUG_LAYERWISE_TIMING": _lazy_bool(

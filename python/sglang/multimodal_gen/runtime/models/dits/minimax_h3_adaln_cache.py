@@ -140,11 +140,25 @@ class MiniMaxH3AdalnHostTier:
         self.block_width = block_width
         self.page_numel = self.block_numel + final_width
         page_bytes = self.page_numel * 2
-        budget = _host_cache_budget_bytes()
-        num_pages = max(0, min(capacity_bytes, budget)) // page_bytes
-        self._slab, self.pinned, num_pages = _allocate_host_slab(
-            num_pages=num_pages, page_numel=self.page_numel
+        from sglang.multimodal_gen.runtime.managers.memory_managers import early_pinned
+
+        reserved = early_pinned.take(
+            early_pinned.ADALN_HOST_TIER,
+            min(capacity_bytes, early_pinned.reserved_bytes(early_pinned.ADALN_HOST_TIER)),
         )
+        if reserved is not None:
+            # SGLANG_DIFFUSION_EARLY_PINNED: pinned at worker start in clean memory, sized from the same option.
+            num_pages = min(capacity_bytes, reserved.numel()) // page_bytes
+            self._slab = (
+                reserved[: num_pages * page_bytes].view(_BF16_DTYPE).view(num_pages, self.page_numel)
+            )
+            self.pinned = True
+        else:
+            budget = _host_cache_budget_bytes()
+            num_pages = max(0, min(capacity_bytes, budget)) // page_bytes
+            self._slab, self.pinned, num_pages = _allocate_host_slab(
+                num_pages=num_pages, page_numel=self.page_numel
+            )
         num_pages = _all_ranks_min(num_pages, device=device)
         self.num_pages = num_pages
         self._free_pages = list(range(num_pages))
