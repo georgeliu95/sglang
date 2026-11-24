@@ -159,7 +159,7 @@ class MiniMaxH3AdalnHostTier:
             self._slab, self.pinned, num_pages = _allocate_host_slab(
                 num_pages=num_pages, page_numel=self.page_numel
             )
-        num_pages = _all_ranks_min(num_pages, device=device)
+        num_pages = _all_ranks_min(num_pages)
         self.num_pages = num_pages
         self._free_pages = list(range(num_pages))
         self._plans: dict[tuple[int, ...], _HostPlan] = {}
@@ -378,19 +378,23 @@ def _allocate_host_slab(
     return torch.empty((0, page_numel), dtype=_BF16_DTYPE), False, 0
 
 
-def _all_ranks_min(value: int, *, device: torch.device) -> int:
+def _all_ranks_min(value: int) -> int:
     """Every rank must run the same tier capacity or build()'s collectives
-    desynchronize; MIN over the world group is the conservative agreement."""
+    desynchronize; MIN over the world group is the conservative agreement.
+
+    The value is a host integer agreed once at load, so it goes over the world
+    group's Gloo CPU group. A device all-reduce would connect the world group's
+    NCCL communicator for this one integer, and with no GPUDirect RDMA (GB10)
+    NCCL pins host staging buffers per connection for the process lifetime.
+    """
     if not torch.distributed.is_initialized() or not world_group_is_initialized():
         return value
     if torch.distributed.get_world_size() == 1:
         return value
-    probe = torch.tensor(
-        [value],
-        dtype=torch.int64,
-        device=device if device.type == "cuda" else "cpu",
+    probe = torch.tensor([value], dtype=torch.int64)
+    torch.distributed.all_reduce(
+        probe, op=torch.distributed.ReduceOp.MIN, group=get_world_group().cpu_group
     )
-    probe = get_world_group().all_reduce(probe, op=torch.distributed.ReduceOp.MIN)
     return int(probe.item())
 
 
