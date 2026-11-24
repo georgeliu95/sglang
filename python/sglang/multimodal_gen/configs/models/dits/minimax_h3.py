@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+import os
 from dataclasses import dataclass, field
 
 from sglang.multimodal_gen.configs.models.dits.base import DiTArchConfig, DiTConfig
@@ -6,7 +7,10 @@ from sglang.multimodal_gen.configs.models.dits.minimax_h3_vdn import (
     VDNHybridAttentionArchConfig,
 )
 
-MINIMAX_H3_PACKED_SEQUENCE_ALIGNMENT = 64
+# SGLANG_H3_SV_PIPELINE=1 (Spark zero-SM Ulysses pipeline, MiniMaxH3Attention._sv_pipeline_forward): its INT8 wire needs every
+# rank's row shard to be a multiple of 64 rows, so the packed sequence is padded to 64 x 8 (every Ulysses size up to 8); the
+# padding is trailing and `used` is unchanged (S = 37765 pads to 37888 either way).
+MINIMAX_H3_PACKED_SEQUENCE_ALIGNMENT = 512 if os.environ.get("SGLANG_H3_SV_PIPELINE") == "1" else 64
 MINIMAX_H3_ADALN_MODALITY_NUM = 3
 
 

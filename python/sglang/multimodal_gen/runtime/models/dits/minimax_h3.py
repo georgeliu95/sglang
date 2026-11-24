@@ -431,6 +431,10 @@ def _accepts_mxfp8_input(linear: nn.Module) -> bool:
 # per-token quantizer they replace (kernels/ops/quantization/token_fp8_fused.py, test_token_fp8_fusion.py).
 _TOKEN_FP8_FUSION = os.environ.get("SGLANG_H3_TOKEN_FP8_FUSION", "0") == "1"
 
+# SGLANG_H3_SV_PIPELINE=1: DiT attention blocks under pure Ulysses run through the Spark zero-SM Ulysses pipeline
+# (MiniMaxH3Attention._sv_pipeline_forward); the package is imported only on that path.
+_H3_SV_PIPELINE = os.environ.get("SGLANG_H3_SV_PIPELINE", "0") == "1"
+
 
 def _accepts_token_fp8_input(linear: nn.Module) -> bool:
     return (
@@ -1467,6 +1471,17 @@ class MiniMaxH3Attention(nn.Module):
                 max_seqlen=max_seqlen,
             )
 
+        if _H3_SV_PIPELINE and ulysses_active and not ring_active:
+            out = self._sv_pipeline_forward(
+                x,
+                rope_cache=rope_cache,
+                cu_seqlens_host=cu_seqlens_host,
+                subblock_sparse_query_block_mask=subblock_sparse_query_block_mask,
+                x_prequant=x_prequant,
+            )
+            if out is not None:
+                return out
+
         total = x.shape[0]
         qkv, _ = self.qkv_proj(x if x_prequant is None else x_prequant)
         q, k, v = qkv.split(self.local_inner_dim, dim=-1)
@@ -1512,6 +1527,40 @@ class MiniMaxH3Attention(nn.Module):
             return self._out_proj_head_scaled(out)
         out, _ = self.out_proj(out)
         return out
+
+    def _sv_pipeline_forward(
+        self,
+        x: torch.Tensor,
+        *,
+        rope_cache: tuple[torch.Tensor, torch.Tensor] | None,
+        cu_seqlens_host: tuple[int, ...] | None,
+        subblock_sparse_query_block_mask: torch.Tensor | None,
+        x_prequant: tuple[torch.Tensor, torch.Tensor] | None,
+    ) -> torch.Tensor | None:
+        """SGLANG_H3_SV_PIPELINE=1: the whole attention block (QKV GEMM .. out_proj) through the Spark zero-SM Ulysses
+        pipeline (package ``h3_attention_adapter``, subblock_sparse/SPARK_SV_PIPELINE.md), or None when the call is
+        not admitted and the path below runs. It replaces only the SubBlock Sage A2A backend (same routing schedule: top-k
+        per step after the dense first steps, H3 mixed rows) and takes the producer's E4M3 input (x_prequant) in place.
+        The package is imported only here: without the variable nothing changes."""
+        _minimax_h3_bind_attention_backend(self, x.dtype)
+        if (
+            self._attention_backend_enum
+            is not AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN_SM120_SAGE_A2A
+        ):
+            return None
+        from h3_attention_adapter import maybe_forward
+
+        return maybe_forward(
+            self,
+            x,
+            rope_cache=rope_cache,
+            cu_seqlens_host=cu_seqlens_host,
+            query_block_mask=subblock_sparse_query_block_mask,
+            ulysses_active=True,
+            ring_active=False,
+            x_prequant=x_prequant,
+            layer_enabled=getattr(self._attention_impl, "layer_enabled", True),
+        )
 
     def _out_proj_head_scaled(self, operand: HeadScaledOperand) -> torch.Tensor:
         """out_proj on the e4m3h operand: sglang's head-scaled CuTe GEMM with the layer's own per-channel E4M3
