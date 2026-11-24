@@ -41,7 +41,7 @@ nothing changes, and the package is never imported. It has the same shape as
 The pipeline needs these on `PYTHONPATH`:
 
 - `communication_ulysses_overlap/src` and `communication_ulysses_overlap/shared`
-  (gitlab-master `yanwa/communication_ulysses_overlap`, branch `gb10-vsa/bsa-fp8`, commit `e0c65d1` or later). Build
+  (gitlab-master `yanwa/communication_ulysses_overlap`, branch `gb10-vsa/bsa-fp8`, commit `5bd96dd` or later). Build
   `spark_verbs/libsv.so` next to `sv_channel.py`:
   `gcc -O2 -shared -fPIC -o libsv.so sv.c -libverbs -lpthread`.
 - `Block-Sparse-Attention` (the SM120 blk64 Sage sources and operand helpers).
@@ -125,3 +125,29 @@ Accuracy:
   computing with permuted weights.
 - Admission depends only on shapes and dtypes, so every rank of the Ulysses
   group takes the same decision.
+- Not admitted: layers whose parameters are streamed by DiT layerwise offload
+  (their storage is swapped per use, which would undo the one-time row
+  permutation), and calls under CUDA graph capture (a replay would skip the
+  host side of the transport). A prepared layer whose weights were replaced
+  anyway raises.
+- Set `SGLANG_H3_SV_PIPELINE=1` in the main process and in the workers: the
+  packed-sequence alignment is decided where the request is packed.
+- Each distinct packed geometry (seq_len, used) gets its own pipeline with its
+  own pinned RDMA buffers, kept for the life of the process.
+
+## Concurrency and determinism
+
+- Inside the pipeline no kernel runs next to the attention. Every kernel is on
+  one compute stream; the other streams only hold RDMA memops.
+- The default attention kernel (gb10-sage-attn + fused wire) and CAKE return
+  the same bits even next to concurrent GEMMs or small CTAs of other kernels
+  (`tests/check_attn_concurrency.py` on GB10, 20 runs per case). The
+  Block-Sparse-Attention blk64 kernels do not: they return wrong rows next to
+  small CTAs. They are only used when set explicitly, or as the last fallback,
+  with a warning.
+- The RoPE cache is bound by tensor identity and version, not by address. H3
+  builds it per request, and a later request with the same token count but
+  other positions can reuse the freed address.
+- Transport sequence numbers compare cyclically and may pass 2^32
+  (`tests/check_own_direct.py --seq-wrap`). A failed RDMA post or completion
+  aborts the process instead of re-posting.

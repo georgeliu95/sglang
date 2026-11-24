@@ -1471,13 +1471,19 @@ class MiniMaxH3Attention(nn.Module):
                 max_seqlen=max_seqlen,
             )
 
-        if _H3_SV_PIPELINE and ulysses_active and not ring_active:
+        # A prepared layer (QKV rows permuted in place) always enters: the package raises on a call it does not admit.
+        if _H3_SV_PIPELINE and (
+            (ulysses_active and not ring_active)
+            or getattr(self, "_sv_layer", None) is not None
+        ):
             out = self._sv_pipeline_forward(
                 x,
                 rope_cache=rope_cache,
                 cu_seqlens_host=cu_seqlens_host,
                 subblock_sparse_query_block_mask=subblock_sparse_query_block_mask,
                 x_prequant=x_prequant,
+                ulysses_active=ulysses_active,
+                ring_active=ring_active,
             )
             if out is not None:
                 return out
@@ -1536,6 +1542,8 @@ class MiniMaxH3Attention(nn.Module):
         cu_seqlens_host: tuple[int, ...] | None,
         subblock_sparse_query_block_mask: torch.Tensor | None,
         x_prequant: tuple[torch.Tensor, torch.Tensor] | None,
+        ulysses_active: bool,
+        ring_active: bool,
     ) -> torch.Tensor | None:
         """SGLANG_H3_SV_PIPELINE=1: the whole attention block (QKV GEMM .. out_proj) through the Spark zero-SM Ulysses
         pipeline (package ``h3_attention_adapter``, subblock_sparse/SPARK_SV_PIPELINE.md), or None when the call is
@@ -1556,8 +1564,8 @@ class MiniMaxH3Attention(nn.Module):
             rope_cache=rope_cache,
             cu_seqlens_host=cu_seqlens_host,
             query_block_mask=subblock_sparse_query_block_mask,
-            ulysses_active=True,
-            ring_active=False,
+            ulysses_active=ulysses_active,
+            ring_active=ring_active,
             x_prequant=x_prequant,
             layer_enabled=getattr(self._attention_impl, "layer_enabled", True),
         )
