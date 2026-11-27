@@ -41,7 +41,7 @@ nothing changes, and the package is never imported. It has the same shape as
 The pipeline needs these on `PYTHONPATH`:
 
 - `communication_ulysses_overlap/src` and `communication_ulysses_overlap/shared`
-  (gitlab-master `yanwa/communication_ulysses_overlap`, branch `gb10-vsa/bsa-fp8`, commit `5bd96dd` or later). Build
+  (gitlab-master `yanwa/communication_ulysses_overlap`, branch `gb10-vsa/bsa-fp8`, commit `5822282` or later). Build
   `spark_verbs/libsv.so` next to `sv_channel.py`:
   `gcc -O2 -shared -fPIC -o libsv.so sv.c -libverbs -lpthread`.
 - `Block-Sparse-Attention` (the SM120 blk64 Sage sources and operand helpers).
@@ -112,13 +112,34 @@ Accuracy:
     rounding difference into a different sample of the same prompt.
   - The frames show the same scene, composition and motion, with no artifacts.
 
+## Bit-identical to main (`SV_H3_ALIGN=main`)
+
+The default path above is faster than main but not bit-identical to it: its Sage statistics / quantization details,
+norm/RoPE in the GEMM epilogue, the fa4w kernel and the FP8 output with a per-row requant differ from main, so the
+video is a different sample of the same prompt (PSNR-Y ~21 dB, the same spread main has across Ulysses sizes).
+
+With `SV_H3_ALIGN=main` the package runs main's own numerics on the pipeline's schedule and transport: main's CuTe FP8
+GEMM per group of head bands (the GEMM is column-local, so a column subset has the full GEMM's bits),
+`fused_inplace_qknorm_rope`, FlashInfer `_ulysses_lowp` statistics per head group (the K-mean rank sum runs on main's
+full-width layout: torch's reduction order changes with the width at 8 ranks), per-band `quant_and_pack`, CAKE operands,
+`route_prequantized`, CAKE, the e4m3h encode and the head-scaled out_proj. Main's 64-row packing is kept.
+
+- **Real H3 at 4 Sparks:** both clips are byte-identical to main's (md5 equal), and every attention call took this path.
+- **One layer:** main's `PreparedPipeline` and this path give the same out_proj output bits on every rank, dense and routed
+  (`tests/check_main_aligned_layer.py`, U2 and U4).
+- **Speed:** +1.3% (dense) / +3.2% (routed) per step against main at 4 Sparks: with CAKE and the GEMMs fixed, the
+  pipeline's overlap does not pay for its per-group overhead yet. Byte-exact fused kernels for the memory passes
+  (quantization, norm/RoPE + statistics, gate + norm; `SV_ALIGN_FUSED_QUANT=1`, `SV_ALIGN_FUSED_NORM=1`) are in the
+  package and are being validated.
+
 ## Constraints
 
 - Pure Ulysses with world 2, 4 or 8; no ring. Every head count divides by the
   world size, and head_dim is 128.
 - The packed sequence is padded to a multiple of 512 rows (64 × 8): each rank's
   INT8 wire shard must be a multiple of 64 rows. For H3, 37765 rows pad to
-  37888, the same as at the default alignment of 64.
+  37888 (main's 64-row alignment gives 37824). `SV_H3_ALIGN=main` keeps main's
+  alignment.
 - The delivery's FP8 per-channel QKV and out_proj weights are required. The QKV
   rows are permuted in place once, so a prepared layer can no longer run the
   delivery path. A non-admitted call on such a layer raises instead of

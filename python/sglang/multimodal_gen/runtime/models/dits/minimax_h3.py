@@ -1475,6 +1475,7 @@ class MiniMaxH3Attention(nn.Module):
         if _H3_SV_PIPELINE and (
             (ulysses_active and not ring_active)
             or getattr(self, "_sv_layer", None) is not None
+            or getattr(self, "_sv_align", None) is not None
         ):
             out = self._sv_pipeline_forward(
                 x,
