@@ -434,6 +434,7 @@ _TOKEN_FP8_FUSION = os.environ.get("SGLANG_H3_TOKEN_FP8_FUSION", "0") == "1"
 # SGLANG_H3_SV_PIPELINE=1: DiT attention blocks under pure Ulysses run through the Spark zero-SM Ulysses pipeline
 # (MiniMaxH3Attention._sv_pipeline_forward); the package is imported only on that path.
 _H3_SV_PIPELINE = os.environ.get("SGLANG_H3_SV_PIPELINE", "0") == "1"
+_H3_SV_FUSE_BLOCK = _H3_SV_PIPELINE and os.environ.get("SV_H3_FUSE_BLOCK", "1") == "1"
 
 
 def _accepts_token_fp8_input(linear: nn.Module) -> bool:
@@ -2019,50 +2020,69 @@ class MiniMaxH3DiTBlock(nn.Module):
             ulysses_active=ulysses_active,
             ring_active=ring_active,
         )
-        x = _modulate_gate(
-            residual,
-            gate_msa,
-            h,
-            combined_indices,
-            dtype=_BF16_DTYPE,
-            allow_inplace=not self.preserve_input_for_cache_dit,
-        )
+        # SV_H3_FUSE_BLOCK=1: the gated residual and norm2 + AdaLN + per-token E4M3 in one pass, with these two kernels' bits
+        # (package h3_fused_block); None wherever main would not run exactly them.
+        fused_block = None
+        if (
+            _H3_SV_FUSE_BLOCK
+            and not _accepts_mxfp8_input(self.mlp.fc1)
+            and MINIMAX_H3_NORM_MODULATE.is_enabled(self)
+            and _accepts_token_fp8_input(self.mlp.fc1)
+        ):
+            from h3_fused_block import maybe_gate_norm
 
-        residual = x
-        if _accepts_mxfp8_input(self.mlp.fc1):
-            h = self.norm2(x)
-            if can_use_mxfp8_swizzled(h):
-                _, h_fp8, h_scales = indexed_scale_shift_mxfp8_(
-                    h, shift_mlp, scale_mlp, combined_indices, keep_bf16=False
-                )
-                h = self.mlp((h_fp8, h_scales))
-            else:
-                h = _modulate_scale_shift(
-                    h, shift_mlp, scale_mlp, combined_indices, dtype=_BF16_DTYPE
-                )
-                h = self.mlp(h)
-        else:
-            fused_norm = MINIMAX_H3_NORM_MODULATE.is_enabled(self)
-            token = (
-                _modulate_rmsnorm_token_fp8(
-                    x, self.norm2, shift_mlp, scale_mlp, combined_indices, keep_bf16=False
-                )
-                if fused_norm and _accepts_token_fp8_input(self.mlp.fc1)
-                else None
+            fused_block = maybe_gate_norm(
+                self, residual, gate_msa, h, combined_indices, shift_mlp, scale_mlp
             )
-            if token is not None:
-                h = self.mlp(token[1])
+        if fused_block is not None:
+            x, token = fused_block
+            residual = x
+            h = self.mlp(token)
+        else:
+            x = _modulate_gate(
+                residual,
+                gate_msa,
+                h,
+                combined_indices,
+                dtype=_BF16_DTYPE,
+                allow_inplace=not self.preserve_input_for_cache_dit,
+            )
+
+            residual = x
+            if _accepts_mxfp8_input(self.mlp.fc1):
+                h = self.norm2(x)
+                if can_use_mxfp8_swizzled(h):
+                    _, h_fp8, h_scales = indexed_scale_shift_mxfp8_(
+                        h, shift_mlp, scale_mlp, combined_indices, keep_bf16=False
+                    )
+                    h = self.mlp((h_fp8, h_scales))
+                else:
+                    h = _modulate_scale_shift(
+                        h, shift_mlp, scale_mlp, combined_indices, dtype=_BF16_DTYPE
+                    )
+                    h = self.mlp(h)
             else:
-                h = _modulate_rmsnorm_scale_shift(
-                    x,
-                    self.norm2,
-                    shift_mlp,
-                    scale_mlp,
-                    combined_indices,
-                    dtype=_BF16_DTYPE,
-                    fused=fused_norm,
+                fused_norm = MINIMAX_H3_NORM_MODULATE.is_enabled(self)
+                token = (
+                    _modulate_rmsnorm_token_fp8(
+                        x, self.norm2, shift_mlp, scale_mlp, combined_indices, keep_bf16=False
+                    )
+                    if fused_norm and _accepts_token_fp8_input(self.mlp.fc1)
+                    else None
                 )
-                h = self.mlp(h)
+                if token is not None:
+                    h = self.mlp(token[1])
+                else:
+                    h = _modulate_rmsnorm_scale_shift(
+                        x,
+                        self.norm2,
+                        shift_mlp,
+                        scale_mlp,
+                        combined_indices,
+                        dtype=_BF16_DTYPE,
+                        fused=fused_norm,
+                    )
+                    h = self.mlp(h)
         # `residual` is block-local here (see above), so this stays in-place
         # even while Cache-DiT is attached.
         return _modulate_gate(
