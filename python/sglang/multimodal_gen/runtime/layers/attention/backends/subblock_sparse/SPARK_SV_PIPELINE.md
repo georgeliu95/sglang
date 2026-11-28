@@ -124,13 +124,26 @@ GEMM per group of head bands (the GEMM is column-local, so a column subset has t
 full-width layout: torch's reduction order changes with the width at 8 ranks), per-band `quant_and_pack`, CAKE operands,
 `route_prequantized`, CAKE, the e4m3h encode and the head-scaled out_proj. Main's 64-row packing is kept.
 
+CAKE and the GEMMs stay main's kernels. The memory passes around them run as fused kernels that reproduce main's bytes
+(package `h3_fused_*`, all on by default, each checked byte for byte against main's kernels):
+- QK-norm + RoPE and the Sage statistics (Q group amax, K sum in FlashInfer's lane order, V amax) in one pass per head
+  group; Q is not written back, the quantization recomputes it (`SV_ALIGN_FUSED_NORM`, `SV_ALIGN_LAZY_Q`,
+  `SV_ALIGN_FUSE_KSUM`);
+- quantize-and-pack of a whole head group in one launch, K group amax included, with this rank's own row written straight
+  into its receive slot (`SV_ALIGN_FUSED_QUANT`, `SV_ALIGN_OWN_DIRECT`);
+- the gated residual + norm2 + AdaLN + per-token E4M3 before the MLP (`SV_H3_FUSE_BLOCK`).
+
+The head bands go through the QKV GEMM in two groups (U4: 7 + 7, `SV_ALIGN_GROUPS`).
+
 - **Real H3 at 4 Sparks:** both clips are byte-identical to main's (md5 equal), and every attention call took this path.
 - **One layer:** main's `PreparedPipeline` and this path give the same out_proj output bits on every rank, dense and routed
-  (`tests/check_main_aligned_layer.py`, U2 and U4).
-- **Speed:** +1.3% (dense) / +3.2% (routed) per step against main at 4 Sparks: with CAKE and the GEMMs fixed, the
-  pipeline's overlap does not pay for its per-group overhead yet. Byte-exact fused kernels for the memory passes
-  (quantization, norm/RoPE + statistics, gate + norm; `SV_ALIGN_FUSED_QUANT=1`, `SV_ALIGN_FUSED_NORM=1`) are in the
-  package and are being validated.
+  (`tests/check_main_aligned_layer.py`: U4 with the current defaults; U2 with the first, unfused version).
+- **Speed (4 Sparks, main and this path back to back on the same nodes):** denoise 166.2 s vs 171.2 s (-2.9%); dense
+  step 6194 vs 6340 ms (-2.3%), routed step 3816 vs 3946 ms (-3.3%). One attention layer at step 20: 43.7 vs 45.4-45.6
+  ms (-3.6% to -4.1%). CAKE and the GEMMs are about 31 of the 44 ms of kernel time per layer, so the remaining room is
+  in the memory passes.
+- **Tried, kept off:** the fc1 SwiGLU in the GEMM epilogue (`SV_H3_FUSE_SWIGLU=1`: byte-exact, slower on GB10) and
+  CAKE reading Q / K in place from the RDMA receive buffers (byte-exact, slower: those buffers are pinned host memory).
 
 ## Constraints
 
