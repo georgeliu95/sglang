@@ -431,6 +431,15 @@ def _accepts_mxfp8_input(linear: nn.Module) -> bool:
 # per-token quantizer they replace (kernels/ops/quantization/token_fp8_fused.py, test_token_fp8_fusion.py).
 _TOKEN_FP8_FUSION = os.environ.get("SGLANG_H3_TOKEN_FP8_FUSION", "0") == "1"
 
+# SGLANG_H3_SV_PIPELINE=1: DiT attention blocks under pure Ulysses run through the Spark zero-SM Ulysses pipeline
+# (MiniMaxH3Attention._sv_pipeline_forward); the package is imported only on that path.
+_H3_SV_PIPELINE = os.environ.get("SGLANG_H3_SV_PIPELINE", "0") == "1"
+_H3_SV_FUSE_BLOCK = _H3_SV_PIPELINE and os.environ.get("SV_H3_FUSE_BLOCK", "1") == "1"
+# MLP fc1 + SwiGLU + per-token E4M3 in the GEMM epilogue (package h3_cute_swiglu), main's bits, validated per layer.
+# Off by default: bit-exact, but measured slower on GB10 (fc1 + SwiGLU 18.3 vs main 17.3 ms at U4: the epilogue math and
+# scattered stores cost more than the [T, 2F] round trip they save).
+_H3_SV_FUSE_SWIGLU = _H3_SV_PIPELINE and os.environ.get("SV_H3_FUSE_SWIGLU", "0") == "1"
+
 
 def _accepts_token_fp8_input(linear: nn.Module) -> bool:
     return (
@@ -1467,6 +1476,24 @@ class MiniMaxH3Attention(nn.Module):
                 max_seqlen=max_seqlen,
             )
 
+        # A prepared layer (QKV rows permuted in place) always enters: the package raises on a call it does not admit.
+        if _H3_SV_PIPELINE and (
+            (ulysses_active and not ring_active)
+            or getattr(self, "_sv_layer", None) is not None
+            or getattr(self, "_sv_align", None) is not None
+        ):
+            out = self._sv_pipeline_forward(
+                x,
+                rope_cache=rope_cache,
+                cu_seqlens_host=cu_seqlens_host,
+                subblock_sparse_query_block_mask=subblock_sparse_query_block_mask,
+                x_prequant=x_prequant,
+                ulysses_active=ulysses_active,
+                ring_active=ring_active,
+            )
+            if out is not None:
+                return out
+
         total = x.shape[0]
         qkv, _ = self.qkv_proj(x if x_prequant is None else x_prequant)
         q, k, v = qkv.split(self.local_inner_dim, dim=-1)
@@ -1512,6 +1539,42 @@ class MiniMaxH3Attention(nn.Module):
             return self._out_proj_head_scaled(out)
         out, _ = self.out_proj(out)
         return out
+
+    def _sv_pipeline_forward(
+        self,
+        x: torch.Tensor,
+        *,
+        rope_cache: tuple[torch.Tensor, torch.Tensor] | None,
+        cu_seqlens_host: tuple[int, ...] | None,
+        subblock_sparse_query_block_mask: torch.Tensor | None,
+        x_prequant: tuple[torch.Tensor, torch.Tensor] | None,
+        ulysses_active: bool,
+        ring_active: bool,
+    ) -> torch.Tensor | None:
+        """SGLANG_H3_SV_PIPELINE=1: the whole attention block (QKV GEMM .. out_proj) through the Spark zero-SM Ulysses
+        pipeline (package ``h3_attention_adapter``, subblock_sparse/SPARK_SV_PIPELINE.md), or None when the call is
+        not admitted and the path below runs. It replaces only the SubBlock Sage A2A backend (same routing schedule: top-k
+        per step after the dense first steps, H3 mixed rows) and takes the producer's E4M3 input (x_prequant) in place.
+        The package is imported only here: without the variable nothing changes."""
+        _minimax_h3_bind_attention_backend(self, x.dtype)
+        if (
+            self._attention_backend_enum
+            is not AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN_SM120_SAGE_A2A
+        ):
+            return None
+        from h3_attention_adapter import maybe_forward
+
+        return maybe_forward(
+            self,
+            x,
+            rope_cache=rope_cache,
+            cu_seqlens_host=cu_seqlens_host,
+            query_block_mask=subblock_sparse_query_block_mask,
+            ulysses_active=ulysses_active,
+            ring_active=ring_active,
+            x_prequant=x_prequant,
+            layer_enabled=getattr(self._attention_impl, "layer_enabled", True),
+        )
 
     def _out_proj_head_scaled(self, operand: HeadScaledOperand) -> torch.Tensor:
         """out_proj on the e4m3h operand: sglang's head-scaled CuTe GEMM with the layer's own per-channel E4M3
@@ -1677,7 +1740,20 @@ class MiniMaxH3MLP(nn.Module):
                 torch.mps.synchronize()
                 torch.mps.empty_cache()
             return out
-        hidden, _ = self.fc1(x)
+        if (
+            _H3_SV_FUSE_SWIGLU
+            and isinstance(x, tuple)
+            and not self.reuse_fc1_activation
+            and not _accepts_mxfp8_input(self.fc2)
+            and _accepts_token_fp8_input(self.fc2)
+        ):
+            from h3_cute_swiglu import maybe_fc1_swiglu
+
+            token = maybe_fc1_swiglu(self.fc1, x, self._main_swiglu_token)
+            if token is not None:
+                out, _ = self.fc2(token)
+                return out
+        hidden = self._fc1_hidden(x)
         if _accepts_mxfp8_input(self.fc2) and can_use_silu_mul_mxfp8(hidden):
             out, _ = self.fc2(silu_mul_mxfp8(hidden))
             return out
@@ -1698,6 +1774,27 @@ class MiniMaxH3MLP(nn.Module):
         hidden = _silu_mul(hidden, reuse_input=self.reuse_fc1_activation)
         out, _ = self.fc2(hidden)
         return out
+
+    def _fc1_hidden(self, x) -> torch.Tensor:
+        hidden, _ = self.fc1(x)
+        if getattr(self.fc1, "_h3_swiglu", False):
+            # fc1's weight columns are interleaved (h3_cute_swiglu): back to [gate | up], same values
+            from h3_cute_swiglu import deinterleave_hidden
+
+            hidden = deinterleave_hidden(hidden)
+        return hidden
+
+    def _main_swiglu_token(self, x):
+        """main's fc1 + silu_mul_fp8 for token input x, or None where main takes another path."""
+        hidden, _ = self.fc1(x)
+        if hidden.shape[-1] % 16 != 0:
+            return None
+        from sglang.kernels.ops.quantization.token_fp8_fused import (
+            can_use_silu_mul_fp8,
+            silu_mul_fp8,
+        )
+
+        return silu_mul_fp8(hidden) if can_use_silu_mul_fp8(hidden) else None
 
 
 class MiniMaxH3AdalnProj(nn.Module):
@@ -1893,7 +1990,9 @@ class MiniMaxH3DiTBlock(nn.Module):
         ulysses_active: bool = False,
         ring_active: bool = False,
         adaln_params: tuple[torch.Tensor, ...] | None = None,
-    ) -> torch.Tensor:
+        pending_gate: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+        defer_gate: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """x: [T, H]; adaln_input: [M, t_dim]; combined_indices: [T]
         (= inverse_indices * modality_num + token_tags.clamp(min=0)).
 
@@ -1911,12 +2010,33 @@ class MiniMaxH3DiTBlock(nn.Module):
             else:
                 raise ValueError("MiniMax H3 AdaLN cache parameters are required")
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = adaln_params
+        # SV_H3_FUSE_BLOCK: the previous block's MLP gated residual (pending_gate = (residual, gate_mlp, h), deferred by
+        # defer_gate) and this block's norm1 + AdaLN + per-token E4M3 in one pass, with main's bits.
+        fused_in = None
+        if pending_gate is not None:
+            if (
+                not _accepts_mxfp8_input(self.attn.qkv_proj)
+                and MINIMAX_H3_NORM_MODULATE.is_enabled(self)
+                and _accepts_token_fp8_input(self.attn.qkv_proj)
+            ):
+                from h3_fused_block import maybe_gate_norm
+
+                fused_in = maybe_gate_norm(
+                    self, *pending_gate, combined_indices, shift_msa, scale_msa,
+                    norm=self.norm1, keep_bf16=True, inplace=True,
+                )
+            if fused_in is None:
+                x = _modulate_gate(*pending_gate, combined_indices, dtype=_BF16_DTYPE)
+            else:
+                x = fused_in[0]
         # Cache-DiT retains the inputs to its Fn and Mn block ranges. Only the
         # first gated residual writes to that tensor; the second one operates on
         # a block-local buffer.
         residual = x
         h_prequant = None
-        if _accepts_mxfp8_input(self.attn.qkv_proj):
+        if fused_in is not None:
+            h, h_prequant = fused_in[1]
+        elif _accepts_mxfp8_input(self.attn.qkv_proj):
             h = self.norm1(x)
             if can_use_mxfp8_swizzled(h):
                 # the bf16 modulated rows stay in h for the VDN branch projections
@@ -1961,50 +2081,71 @@ class MiniMaxH3DiTBlock(nn.Module):
             ulysses_active=ulysses_active,
             ring_active=ring_active,
         )
-        x = _modulate_gate(
-            residual,
-            gate_msa,
-            h,
-            combined_indices,
-            dtype=_BF16_DTYPE,
-            allow_inplace=not self.preserve_input_for_cache_dit,
-        )
+        # SV_H3_FUSE_BLOCK=1: the gated residual and norm2 + AdaLN + per-token E4M3 in one pass, with these two kernels' bits
+        # (package h3_fused_block); None wherever main would not run exactly them.
+        fused_block = None
+        if (
+            _H3_SV_FUSE_BLOCK
+            and not _accepts_mxfp8_input(self.mlp.fc1)
+            and MINIMAX_H3_NORM_MODULATE.is_enabled(self)
+            and _accepts_token_fp8_input(self.mlp.fc1)
+        ):
+            from h3_fused_block import maybe_gate_norm
 
-        residual = x
-        if _accepts_mxfp8_input(self.mlp.fc1):
-            h = self.norm2(x)
-            if can_use_mxfp8_swizzled(h):
-                _, h_fp8, h_scales = indexed_scale_shift_mxfp8_(
-                    h, shift_mlp, scale_mlp, combined_indices, keep_bf16=False
-                )
-                h = self.mlp((h_fp8, h_scales))
-            else:
-                h = _modulate_scale_shift(
-                    h, shift_mlp, scale_mlp, combined_indices, dtype=_BF16_DTYPE
-                )
-                h = self.mlp(h)
-        else:
-            fused_norm = MINIMAX_H3_NORM_MODULATE.is_enabled(self)
-            token = (
-                _modulate_rmsnorm_token_fp8(
-                    x, self.norm2, shift_mlp, scale_mlp, combined_indices, keep_bf16=False
-                )
-                if fused_norm and _accepts_token_fp8_input(self.mlp.fc1)
-                else None
+            fused_block = maybe_gate_norm(
+                self, residual, gate_msa, h, combined_indices, shift_mlp, scale_mlp
             )
-            if token is not None:
-                h = self.mlp(token[1])
+        if fused_block is not None:
+            x, (_, token) = fused_block
+            residual = x
+            h = self.mlp(token)
+        else:
+            x = _modulate_gate(
+                residual,
+                gate_msa,
+                h,
+                combined_indices,
+                dtype=_BF16_DTYPE,
+                allow_inplace=not self.preserve_input_for_cache_dit,
+            )
+
+            residual = x
+            if _accepts_mxfp8_input(self.mlp.fc1):
+                h = self.norm2(x)
+                if can_use_mxfp8_swizzled(h):
+                    _, h_fp8, h_scales = indexed_scale_shift_mxfp8_(
+                        h, shift_mlp, scale_mlp, combined_indices, keep_bf16=False
+                    )
+                    h = self.mlp((h_fp8, h_scales))
+                else:
+                    h = _modulate_scale_shift(
+                        h, shift_mlp, scale_mlp, combined_indices, dtype=_BF16_DTYPE
+                    )
+                    h = self.mlp(h)
             else:
-                h = _modulate_rmsnorm_scale_shift(
-                    x,
-                    self.norm2,
-                    shift_mlp,
-                    scale_mlp,
-                    combined_indices,
-                    dtype=_BF16_DTYPE,
-                    fused=fused_norm,
+                fused_norm = MINIMAX_H3_NORM_MODULATE.is_enabled(self)
+                token = (
+                    _modulate_rmsnorm_token_fp8(
+                        x, self.norm2, shift_mlp, scale_mlp, combined_indices, keep_bf16=False
+                    )
+                    if fused_norm and _accepts_token_fp8_input(self.mlp.fc1)
+                    else None
                 )
-                h = self.mlp(h)
+                if token is not None:
+                    h = self.mlp(token[1])
+                else:
+                    h = _modulate_rmsnorm_scale_shift(
+                        x,
+                        self.norm2,
+                        shift_mlp,
+                        scale_mlp,
+                        combined_indices,
+                        dtype=_BF16_DTYPE,
+                        fused=fused_norm,
+                    )
+                    h = self.mlp(h)
+        if defer_gate:
+            return residual, gate_mlp, h
         # `residual` is block-local here (see above), so this stays in-place
         # even while Cache-DiT is attached.
         return _modulate_gate(
@@ -3287,9 +3428,18 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
             # (Ulysses) and/or ring-rotates KV across ring ranks; everything
             # else, including the final layer, is row-local. Only the narrow
             # video/audio logits are gathered after the final layer.
+            # SV_H3_FUSE_BLOCK: each block's last gated residual runs fused with the next block's norm1 (see the block).
+            chain = (
+                _H3_SV_FUSE_BLOCK
+                and type(self.blocks) is nn.ModuleList
+                and not hasattr(self, "_sglang_cache_dit_adapter")
+                and all(type(b) is MiniMaxH3DiTBlock for b in self.blocks)
+            )
+            pending = None
             for index, block in enumerate(self.blocks):
-                hidden = block(
-                    hidden,
+                last = index == len(self.blocks) - 1
+                out = block(
+                    hidden if pending is None else pending[0],
                     adaln_input=adaln_input,
                     combined_indices=block_combined,
                     rope_cache=rope_cache,
@@ -3304,7 +3454,17 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
                         if block_adaln_params is None
                         else block_adaln_params[index]
                     ),
+                    # only the chained (plain ModuleList) path knows these; wrappers keep main's call
+                    **(
+                        {"pending_gate": pending, "defer_gate": not last}
+                        if chain
+                        else {}
+                    ),
                 )
+                if chain and not last:
+                    pending = out
+                else:
+                    hidden, pending = out, None
             if spectrum_on:
                 self._h3_spectrum_record_targets(
                     hidden, audio_pos, infer_out_pos, row_start, row_stop
